@@ -43,6 +43,33 @@ Do not execute implementation from `deep-interview` or `ralplan` unless the user
 
 Subagent await timeouts are observation windows, not failure signals. Do not cancel a subagent merely because `subagent await` timed out; inspect/list, continue independent work, and cancel only when the subagent has actually failed, gone off-track, or become unrecoverably wrong.
 
+## Contributor agent hygiene (Claude / Codex / Grok)
+
+These are **repo-local contributor tools**, not GJC product workflow skills. Do not add them to the four default bundled workflows.
+
+### Session worktree cleanup
+
+After a task is done (tests green, PR opened, or the user says done), **always** clean the session worktree without waiting to be asked:
+
+1. Remove the linked worktree created for **this** task.
+2. If a PR is still **open** → keep local + remote branch.
+3. If the PR is **merged** (or the branch is fully merged into `upstream/dev` / `origin/dev`) → also delete local + `origin` branch when safe.
+4. Never remove the primary checkout, protected branches (`main`/`master`/`dev`/`develop`/`worktree/*`/`release/*`), or worktrees belonging to other active work.
+
+Canonical skill + script (shared by Claude Code, Codex, and Grok via repo-local discovery):
+
+| Item | Path |
+| --- | --- |
+| Skill | [`.agents/skills/cleanup-worktrees/SKILL.md`](.agents/skills/cleanup-worktrees/SKILL.md) |
+| Script | [`.agents/skills/cleanup-worktrees/scripts/cleanup-worktrees.sh`](.agents/skills/cleanup-worktrees/scripts/cleanup-worktrees.sh) |
+| Claude / Grok links | `.claude/skills/cleanup-worktrees`, `.grok/skills/cleanup-worktrees` |
+
+```bash
+./.agents/skills/cleanup-worktrees/scripts/cleanup-worktrees.sh --path /path/to/worktree
+./.agents/skills/cleanup-worktrees/scripts/cleanup-worktrees.sh --branch fix/issue-1234-foo
+./.agents/skills/cleanup-worktrees/scripts/cleanup-worktrees.sh --branch fix/issue-1234-foo --dry-run
+```
+
 ## Repository focus
 
 This repo contains multiple packages, but `packages/coding-agent/` is the primary product surface. Unless otherwise specified, assume work refers to that package.
