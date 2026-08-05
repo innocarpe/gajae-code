@@ -417,9 +417,13 @@ export function needsDarwinArm64TabWorkerSmoke(paths: readonly string[]): boolea
 // run and require the windows-latest job whenever any of these change.
 export function isWindowsSessionPathRegressionPath(changedPath: string): boolean {
 	return changedPath === "packages/coding-agent/src/session/internal/managed-session-scope.ts" ||
+		changedPath === "packages/coding-agent/src/session/internal/managed-session-storage.ts" ||
 		changedPath === "packages/coding-agent/src/session/blob-store.ts" ||
+		changedPath === "packages/coding-agent/src/sdk/session-directory.ts" ||
 		changedPath === "packages/coding-agent/src/session/session-manager.ts" ||
-		changedPath === "packages/coding-agent/test/session-manager/windows-canonical-path.test.ts";
+		changedPath === "packages/coding-agent/test/session-manager/windows-canonical-path.test.ts" ||
+		changedPath === "packages/coding-agent/test/session/managed-lock-lease.windows.test.ts" ||
+		changedPath === "packages/coding-agent/test/sdk-session-directory.windows.test.ts";
 }
 
 export function needsWindowsSessionPathRegression(paths: readonly string[]): boolean {
@@ -696,6 +700,14 @@ function readStringMap(value: unknown): Record<string, string> | undefined {
 
 export function planTasks(paths: readonly string[], packages: readonly WorkspacePackage[]): Task[] {
 	const tasks = new Map<string, Task>();
+	// Mirror of the docs-index gate in planTargetedTasks: docs/ is the source the
+	// embedded index is generated from, so either side changing must run its gate.
+	// The gate loads the generated corpus through the package barrel, so it is a
+	// native consumer and must bring its own producer.
+	if (paths.some(isEmbeddedDocsSourcePath)) {
+		addTestFileTask(tasks, EMBEDDED_DOCS_GATE_TEST);
+		addNativeBuild(tasks);
+	}
 	const touchedPackages = findTouchedPackages(paths, packages);
 	const rootPackageReleaseHarnessOnly = isRootPackageReleaseHarnessOnly(paths);
 	const fullWorkspace = paths.some(isFullWorkspacePath) && !rootPackageReleaseHarnessOnly;
@@ -796,8 +808,17 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 export function planTargetedTasks(paths: readonly string[], packages: readonly WorkspacePackage[], testFiles: readonly string[]): Task[] {
 	const tasks = new Map<string, Task>();
 	const relevant = paths.filter(changedPath => !isDocOrChangelogPath(changedPath));
+	// A docs edit is cheap, but it is not free: docs/ is the source the embedded docs
+	// index is generated from, so shipping the edit without regenerating that index is
+	// the one drift class a docs-only PR can introduce. Select just its gate.
+	if (paths.some(isEmbeddedDocsSourcePath)) {
+		addTestFileTask(tasks, EMBEDDED_DOCS_GATE_TEST);
+	}
 	if (relevant.length === 0) {
-		return [];
+		// The shared ensureNativeBuild escalation is past this return, and the gate is
+		// a native consumer, so apply it here or the shard ships with no producer.
+		ensureNativeBuild(tasks);
+		return [...tasks.values()];
 	}
 
 	const fullWorkspace = relevant.some(isFullWorkspacePath) && !isRootPackageReleaseHarnessOnly(relevant);
@@ -1004,6 +1025,14 @@ function ensureNativeBuild(tasks: Map<string, Task>): void {
 
 function isDocOrChangelogPath(changedPath: string): boolean {
 	return changedPath.endsWith(".md") || changedPath.startsWith("docs/") || changedPath.startsWith(".gjc/");
+}
+
+/** The generated index embeds every markdown file under `docs/`, so one test gates both sides. */
+const EMBEDDED_DOCS_GATE_TEST = "packages/coding-agent/test/docs-index-lazy.test.ts";
+const GENERATED_DOCS_INDEX = "packages/coding-agent/src/internal-urls/docs-index.generated.ts";
+
+function isEmbeddedDocsSourcePath(changedPath: string): boolean {
+	return (changedPath.startsWith("docs/") && changedPath.endsWith(".md")) || changedPath === GENERATED_DOCS_INDEX;
 }
 
 function isTestFilePath(changedPath: string): boolean {

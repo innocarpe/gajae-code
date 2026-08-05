@@ -6,9 +6,13 @@ import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildTeamHudSummary as buildWorkflowTeamHudSummary } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
 import type { GcPidProbe, GcRecord } from "./gc-runtime";
-import { applyGjcTmuxProfile } from "./launch-tmux";
 import { modeStatePath, sessionIdFromDirName, sessionReportsDir, teamStateRoot } from "./session-layout";
 import { resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
+import {
+	GJC_COORDINATOR_SESSION_ID_ENV,
+	GJC_TMUX_OWNER_GENERATION_ENV,
+	GJC_TMUX_OWNER_STATE_DIR_ENV,
+} from "./session-state-sidecar";
 import {
 	AlreadyExistsError,
 	appendJsonl as appendJsonlAudited,
@@ -67,10 +71,13 @@ import {
 	workerMemoryGuardLedgerPath,
 } from "./team-worker-memory-guard";
 import {
+	buildGjcContinuationPrompt,
+	GJC_TEAM_CONTINUATION_ACK_POLL_MS,
 	GJC_TEAM_CONTINUATION_PROMPT,
 	type GjcTeamWorkerOrchestrationRuntime,
 	type GjcTeamWorkerRuntime,
 	gjcContinuationReservationDigest,
+	isValidGjcContinuationAck,
 	isValidGjcContinuationOutcome,
 	isValidGjcContinuationReservation,
 	readGjcShutdownAuthority,
@@ -85,10 +92,12 @@ import {
 	writeWorkerLifecycleForConfig as writeLifecycleForConfig,
 	writeWorkerLifecycleRecord as writeLifecycleRecord,
 	writeGjcShutdownRequest as writeShutdownRequest,
+	writeGjcWorkerContinuationAck as writeWorkerContinuationAck,
 	writeGjcWorkerStartupAck as writeWorkerStartupAck,
 } from "./team-workers";
 import {
 	buildGjcTmuxExactOptionTarget,
+	buildGjcTmuxProfileCommands,
 	buildGjcTmuxUntaggedSessionHint,
 	GJC_TMUX_ACTIVE_SESSION_ENV,
 	GJC_TMUX_PROFILE_OPTION,
@@ -96,6 +105,15 @@ import {
 	resolveGjcTmuxBinary,
 	resolveGjcTmuxCommand,
 } from "./tmux-common";
+import {
+	assertGjcTmuxMutationAuthoritySync,
+	bindGjcTmuxProviderAuthority,
+	buildTmuxProviderCommand,
+	hasGjcTmuxProviderAuthoritySync,
+	type ProviderAuthority,
+	readGjcTmuxProviderAuthoritySync,
+	resolveGjcTmuxProviderContext,
+} from "./tmux-provider-context";
 
 export type {
 	GjcTeamApiClaimResult,
@@ -163,6 +181,12 @@ export type GjcTeamWorktreeMode =
 	| { enabled: true; detached: false; name: string };
 
 export interface GjcTeamConfig {
+	/**
+	 * Launch-time platform. Persisted so the monitor path resolves the same
+	 * provider context the launch did instead of re-reading `process.platform`,
+	 * which makes Windows-authority branches unreachable off Windows.
+	 */
+	platform?: NodeJS.Platform;
 	team_name: string;
 	display_name: string;
 	requested_name: string;
@@ -178,6 +202,9 @@ export interface GjcTeamConfig {
 	tmux_session: string;
 	tmux_session_name: string;
 	tmux_target: string;
+	tmux_provider_generation?: string;
+	tmux_provider_state_dir?: string;
+	tmux_provider_session_id?: string;
 	workspace_mode: "direct" | "worktree";
 	dry_run: boolean;
 	leader: GjcTeamLeader;
@@ -519,6 +546,7 @@ export const GJC_TEAM_API_OPERATIONS = [
 	"notification-replay",
 	"notification-mark-pane-attempt",
 	"worker-startup-ack",
+	"worker-continuation-ack",
 	"create-task",
 	"read-task",
 	"list-tasks",
@@ -551,6 +579,40 @@ export const GJC_TEAM_API_OPERATIONS = [
 	"write-task-approval",
 ] as const;
 
+export type GjcTeamApiOperation = (typeof GJC_TEAM_API_OPERATIONS)[number];
+
+export class UnknownGjcTeamApiOperationError extends Error {
+	readonly code = "unknown_team_api_operation";
+	readonly operation: string;
+	readonly suggestions: readonly string[];
+
+	constructor(operation: string, suggestions: readonly string[]) {
+		const guidance =
+			suggestions.length > 0
+				? `did you mean ${suggestions.join(" or ")}?`
+				: "run gjc team api --help for supported operations";
+		super(`unknown_team_api_operation:${operation}; ${guidance}`);
+		this.name = "UnknownGjcTeamApiOperationError";
+		this.operation = operation;
+		this.suggestions = suggestions;
+	}
+}
+
+function isGjcTeamApiOperation(operation: string): operation is GjcTeamApiOperation {
+	return (GJC_TEAM_API_OPERATIONS as readonly string[]).includes(operation);
+}
+
+function unknownGjcTeamApiOperationSuggestions(operation: string): readonly string[] {
+	if (operation === "heartbeat") return ["read-worker-heartbeat", "update-worker-heartbeat"];
+	if (operation === "get-task") return ["read-task"];
+	return [];
+}
+
+function resolveGjcTeamApiOperation(operation: string): GjcTeamApiOperation {
+	if (isGjcTeamApiOperation(operation)) return operation;
+	throw new UnknownGjcTeamApiOperationError(operation, unknownGjcTeamApiOperationSuggestions(operation));
+}
+
 function currentTimeMs(): number {
 	return gjcTeamRuntimeTestSeams?.nowMs?.() ?? Date.now();
 }
@@ -561,9 +623,12 @@ function now(): string {
 
 export interface GjcTeamRuntimeTestSeams {
 	nowMs?: () => number;
-	continuationTmuxDispatch?: (command: string, args: readonly string[]) => { exitCode?: number };
-
+	continuationTmuxDispatch?: (
+		command: string,
+		args: readonly string[],
+	) => { exitCode?: number } | Promise<{ exitCode?: number }>;
 	continuationBeforeDispatch?: () => Promise<void>;
+	continuationAckPoll?: () => Promise<void>;
 }
 
 let gjcTeamRuntimeTestSeams: GjcTeamRuntimeTestSeams | undefined;
@@ -967,8 +1032,15 @@ export async function listTeamWorkerGcRecords(teamRoot: string, probe: GcPidProb
 export async function pruneTeamWorkerGcRecord(record: GcRecord, probe: GcPidProbe): Promise<boolean> {
 	if (!record.path || !record.id.includes("/")) return false;
 	const teamDirPath = path.dirname(path.dirname(record.path));
-	return withGjcTeamTaskMutation(taskStore(teamDirPath), capability =>
-		pruneTeamWorkerGcRecordUnlocked(record, probe, capability),
+	// Prune deletes claim records and rewrites claimed tasks, so it is an
+	// authority-changing operation and must take the same team mutation fence the
+	// rest of the public surface takes. Without it, prune can strip a claim inside
+	// the continuation dispatch window and silently suppress a stalled-worker
+	// continuation.
+	return withGjcTeamMutationFence(teamDirPath, () =>
+		withGjcTeamTaskMutation(taskStore(teamDirPath), capability =>
+			pruneTeamWorkerGcRecordUnlocked(record, probe, capability),
+		),
 	);
 }
 
@@ -1251,6 +1323,7 @@ function manifestRecordFromConfig(config: GjcTeamConfig): Record<string, unknown
 		worker_command: config.worker_command,
 		worker_cli_plan: config.worker_cli_plan,
 		tmux_command: config.tmux_command,
+		tmux_provider_generation: config.tmux_provider_generation,
 		leader: config.leader,
 		workers: config.workers,
 		workspace_mode: config.workspace_mode,
@@ -1494,6 +1567,7 @@ async function relaunchWorkerPaneForMemoryGuard(input: {
 	startupAckPath: string;
 	replacementToken: string;
 	startupAckTimeoutMs: number;
+	env: NodeJS.ProcessEnv;
 }): Promise<string> {
 	if (input.config.dry_run)
 		return `%memory-guard-${input.worker.id}-${stableHash(`${input.worker.id}:${now()}`).slice(0, 8)}`;
@@ -1502,42 +1576,40 @@ async function relaunchWorkerPaneForMemoryGuard(input: {
 		input.worker,
 		input.platform,
 		`Send startup ACK before resuming: gjc team api worker-startup-ack --input '{"team_name":"${input.config.team_name}","worker_id":"${input.worker.id}","protocol_version":"1","replacement_token":"${input.replacementToken}"}' --json. ${GJC_TEAM_CONTINUATION_PROMPT}`,
+		input.env,
 	);
 	const workerCwd = input.worker.worktree_path ?? input.config.leader.cwd;
-	const useSendKeysFallback = shouldDispatchWorkerWithSendKeys(input.config.tmux_command, input.platform);
+	const useSendKeysFallback = shouldDispatchWorkerWithSendKeys(
+		input.config.tmux_command,
+		input.config.tmux_provider_generation,
+	);
 	const splitTarget =
 		input.worker.pane_id && paneBelongsToTeamTarget(input.config, input.worker.pane_id)
 			? input.worker.pane_id
 			: input.config.tmux_target;
-	const split = Bun.spawnSync(
-		[
-			input.config.tmux_command,
-			"split-window",
-			"-v",
-			"-t",
-			splitTarget,
-			"-d",
-			"-P",
-			"-F",
-			"#{pane_id}",
-			"-c",
-			workerCwd,
-			...(useSendKeysFallback ? [] : [workerCommand]),
-		],
-		{ stdout: "pipe", stderr: "pipe" },
-	);
+	const split = executeTeamTmuxMutation(input.config, {
+		type: "split",
+		direction: "-v",
+		target: splitTarget,
+		cwd: workerCwd,
+		...(useSendKeysFallback ? {} : { command: workerCommand }),
+	});
 	if (split.exitCode !== 0)
 		throw new Error(split.stderr.toString().trim() || `memory_guard_split_failed:${input.worker.id}`);
 	const newPaneId = split.stdout.toString().trim().split(/\r?\n/)[0]?.trim() ?? "";
 	if (!newPaneId.startsWith("%")) throw new Error(`memory_guard_split_missing_pane:${input.worker.id}`);
 	if (useSendKeysFallback) {
-		Bun.spawnSync([input.config.tmux_command, "send-keys", "-l", "-t", newPaneId, workerCommand], {
-			stdout: "ignore",
-			stderr: "ignore",
+		executeTeamTmuxMutation(input.config, {
+			type: "literal-send",
+			paneId: newPaneId,
+			text: workerCommand,
+			deferredProof: "worker-startup-ack",
 		});
-		Bun.spawnSync([input.config.tmux_command, "send-keys", "-t", newPaneId, "Enter"], {
-			stdout: "ignore",
-			stderr: "ignore",
+		executeTeamTmuxMutation(input.config, {
+			type: "key-send",
+			paneId: newPaneId,
+			key: "Enter",
+			deferredProof: "worker-startup-ack",
 		});
 	}
 	const startupDeadline = Date.now() + input.startupAckTimeoutMs;
@@ -1555,36 +1627,24 @@ async function relaunchWorkerPaneForMemoryGuard(input: {
 			// The successor may still be publishing its generation-bound ACK.
 		}
 		if (Date.now() >= startupDeadline) {
-			Bun.spawnSync([input.config.tmux_command, "kill-pane", "-t", newPaneId], {
-				stdout: "ignore",
-				stderr: "ignore",
-			});
+			executeTeamTmuxMutation(input.config, { type: "kill-pane", paneId: newPaneId });
 			throw new Error(`memory_guard_successor_startup_timeout:${input.worker.id}`);
 		}
 		await Bun.sleep(50);
 	}
 	const successorPane = probePaneTeamTarget(input.config, newPaneId);
 	if (!successorPane.exists || !successorPane.belongsToTeamTarget) {
-		Bun.spawnSync([input.config.tmux_command, "kill-pane", "-t", newPaneId], {
-			stdout: "ignore",
-			stderr: "ignore",
-		});
+		executeTeamTmuxMutation(input.config, { type: "kill-pane", paneId: newPaneId });
 		throw new Error(`memory_guard_successor_pane_unavailable:${input.worker.id}`);
 	}
 	if (input.worker.pane_id) {
 		const oldPane = probePaneTeamTarget(input.config, input.worker.pane_id);
 		if (oldPane.exists && !oldPane.belongsToTeamTarget) {
-			Bun.spawnSync([input.config.tmux_command, "kill-pane", "-t", newPaneId], {
-				stdout: "ignore",
-				stderr: "ignore",
-			});
+			executeTeamTmuxMutation(input.config, { type: "kill-pane", paneId: newPaneId });
 			throw new Error(`memory_guard_old_pane_outside_team_target:${input.worker.id}`);
 		}
 	}
-	Bun.spawnSync([input.config.tmux_command, "select-layout", "-t", input.config.tmux_target, "main-vertical"], {
-		stdout: "ignore",
-		stderr: "ignore",
-	});
+	executeTeamTmuxMutation(input.config, { type: "layout", target: input.config.tmux_target, layout: "main-vertical" });
 	return newPaneId;
 }
 
@@ -1602,7 +1662,12 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 	allowAutomaticAction?: boolean;
 	replacementToken?: string;
 	dir: string;
-	taskMutation: GjcTeamTaskMutationCapability;
+	/**
+	 * Acquire the team task-mutation fence only for the blocked-state transition.
+	 * Must not be held across the successor startup-ack wait: concurrent
+	 * `worker-startup-ack` must publish while replacement is in flight.
+	 */
+	withTaskMutation: <T>(fn: (capability: GjcTeamTaskMutationCapability) => Promise<T>) => Promise<T>;
 }): Promise<Record<string, unknown>> {
 	const dir = input.dir;
 	const config = await readConfig(dir);
@@ -1782,16 +1847,18 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 		ledger = retried.ledger;
 		await writeWorkerMemoryGuardLedger(dir, ledger);
 		if (retried.finalBlocked)
-			await finalizeWorkerMemoryGuardBlockedState({
-				teamName: input.teamName,
-				dir,
-				worker,
-				task,
-				taskMutation: input.taskMutation,
-				reason: checkpoint.reason,
-				cwd: input.cwd,
-				env: input.env,
-			});
+			await input.withTaskMutation(taskMutation =>
+				finalizeWorkerMemoryGuardBlockedState({
+					teamName: input.teamName,
+					dir,
+					worker,
+					task,
+					taskMutation,
+					reason: checkpoint.reason,
+					cwd: input.cwd,
+					env: input.env,
+				}),
+			);
 		await appendWorkerMemoryGuardAction({
 			dir,
 			teamName: input.teamName,
@@ -1853,6 +1920,7 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 			startupAckPath,
 			replacementToken,
 			startupAckTimeoutMs,
+			env: input.env,
 		});
 	} catch (error) {
 		await restorePredecessorStartupState();
@@ -1868,16 +1936,18 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 		ledger = retried.ledger;
 		await writeWorkerMemoryGuardLedger(dir, ledger);
 		if (retried.finalBlocked)
-			await finalizeWorkerMemoryGuardBlockedState({
-				teamName: input.teamName,
-				dir,
-				worker,
-				task,
-				taskMutation: input.taskMutation,
-				reason,
-				cwd: input.cwd,
-				env: input.env,
-			});
+			await input.withTaskMutation(taskMutation =>
+				finalizeWorkerMemoryGuardBlockedState({
+					teamName: input.teamName,
+					dir,
+					worker,
+					task,
+					taskMutation,
+					reason,
+					cwd: input.cwd,
+					env: input.env,
+				}),
+			);
 		await appendWorkerMemoryGuardAction({
 			dir,
 			teamName: input.teamName,
@@ -1907,10 +1977,7 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 		postAckAuthority.claim.leased_until !== task?.claim?.leased_until ||
 		Date.parse(postAckAuthority.claim.leased_until) <= currentTimeMs()
 	) {
-		Bun.spawnSync([config.tmux_command, "kill-pane", "-t", newPaneId], {
-			stdout: "ignore",
-			stderr: "ignore",
-		});
+		executeTeamTmuxMutation(config, { type: "kill-pane", paneId: newPaneId });
 		await restorePredecessorStartupState();
 		return {
 			ok: true,
@@ -1921,10 +1988,7 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 	}
 	const successorPane = probePaneTeamTarget(config, newPaneId);
 	if (!successorPane.exists || !successorPane.belongsToTeamTarget || !successorPane.pid) {
-		Bun.spawnSync([config.tmux_command, "kill-pane", "-t", newPaneId], {
-			stdout: "ignore",
-			stderr: "ignore",
-		});
+		executeTeamTmuxMutation(config, { type: "kill-pane", paneId: newPaneId });
 		await restorePredecessorStartupState();
 		return {
 			ok: true,
@@ -1954,10 +2018,7 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 		updated_at: nowIso,
 	};
 	const rollbackReplacement = async (): Promise<void> => {
-		Bun.spawnSync([config.tmux_command, "kill-pane", "-t", newPaneId], {
-			stdout: "ignore",
-			stderr: "ignore",
-		});
+		executeTeamTmuxMutation(config, { type: "kill-pane", paneId: newPaneId });
 		if (previousHeartbeat === undefined) await fs.rm(heartbeatPath, { force: true });
 		else await Bun.write(heartbeatPath, previousHeartbeat);
 		await syncTeamConfigAndManifest(dir, config);
@@ -1976,12 +2037,7 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 		if (!cutoverPane.exists || !cutoverPane.belongsToTeamTarget || cutoverPane.pid !== successorHeartbeat.pid)
 			throw new Error(`memory_guard_successor_pane_changed:${worker.id}`);
 		if (worker.pane_id && !config.dry_run) {
-			const killed = Bun.spawnSync([config.tmux_command, "kill-pane", "-t", worker.pane_id], {
-				stdout: "ignore",
-				stderr: "pipe",
-			});
-			if (killed.exitCode !== 0 && probePaneTeamTarget(config, worker.pane_id).exists)
-				throw new Error(killed.stderr.toString().trim() || `memory_guard_kill_failed:${worker.id}`);
+			executeTeamTmuxMutation(config, { type: "kill-pane", paneId: worker.pane_id });
 		}
 	} catch (error) {
 		await rollbackReplacement();
@@ -2043,12 +2099,17 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 }
 
 async function applyWorkerMemoryGuard(
-	input: Omit<Parameters<typeof applyWorkerMemoryGuardUnlocked>[0], "dir" | "taskMutation">,
+	input: Omit<Parameters<typeof applyWorkerMemoryGuardUnlocked>[0], "dir" | "withTaskMutation">,
 ): Promise<Record<string, unknown>> {
 	const dir = await findTeamDir(input.teamName, input.cwd, input.env);
-	return withGjcTeamTaskMutation(taskStore(dir), taskMutation =>
-		applyWorkerMemoryGuardUnlocked({ ...input, dir, taskMutation }),
-	);
+	// Do not hold withGjcTeamTaskMutation across relaunchWorkerPaneForMemoryGuard's
+	// startup-ack poll (default 120s). That fence would serialize concurrent
+	// worker-startup-ack publication and hang selector-replacement under CI load.
+	return applyWorkerMemoryGuardUnlocked({
+		...input,
+		dir,
+		withTaskMutation: fn => withGjcTeamTaskMutation(taskStore(dir), fn),
+	});
 }
 async function readPhase(dir: string): Promise<GjcTeamPhase> {
 	try {
@@ -2087,6 +2148,7 @@ const workerRuntime: GjcTeamWorkerRuntime = {
 	workerDir,
 	readJson: readJsonFile,
 	writeJson: writeJsonFile,
+	withTaskMutation: (dir, fn) => withGjcTeamTaskMutation(taskStore(dir), fn),
 	appendEvent,
 	now,
 	nowMs: currentTimeMs,
@@ -2454,53 +2516,86 @@ function buildTeamTmuxLeaderRequirementMessage(detail?: string): string {
 	const suffix = detail?.trim() ? `:${detail.trim()}` : "";
 	return `gjc_team_requires_tmux_leader: start a tmux session first (run \`gjc --tmux\`, or launch tmux yourself), then run \`gjc team ...\` inside it, or use \`gjc team --dry-run\` for state-only smoke tests${suffix}`;
 }
-function readGjcTmuxProfileValue(tmuxCommand: string, sessionName: string): string {
+function providerExecutableArgv(authority: ProviderAuthority): string[] {
+	if (
+		process.platform === "win32" &&
+		authority.kind === "native-tmux" &&
+		path.isAbsolute(authority.command) &&
+		path.extname(authority.command) === ""
+	)
+		return [
+			path.join(process.env.ProgramFiles ?? "C:\\Program Files", "Git", "bin", "bash.exe"),
+			authority.command.replaceAll("\\", "/"),
+		];
+	return [authority.command];
+}
+function readGjcTmuxProfileValue(authority: ProviderAuthority, sessionName: string): string {
 	const result = Bun.spawnSync(
-		[tmuxCommand, "show-options", "-qv", "-t", buildGjcTmuxExactOptionTarget(sessionName), GJC_TMUX_PROFILE_OPTION],
-		{
-			stdout: "pipe",
-			stderr: "pipe",
-		},
+		[
+			...providerExecutableArgv(authority),
+			...buildTmuxProviderCommand(authority, "show-options", [
+				"-qv",
+				"-t",
+				buildGjcTmuxExactOptionTarget(sessionName, { binary: authority.binary }),
+				GJC_TMUX_PROFILE_OPTION,
+			]),
+		],
+		{ stdout: "pipe", stderr: "pipe" },
 	);
 	if (result.exitCode !== 0) return "";
 	return result.stdout.toString().trim();
 }
 
-function tagTmuxSessionAsGjcLeader(tmuxCommand: string, sessionName: string): boolean {
+function tagTmuxSessionAsGjcLeader(authority: ProviderAuthority, sessionName: string): boolean {
+	assertGjcTmuxMutationAuthoritySync(authority);
 	const result = Bun.spawnSync(
 		[
-			tmuxCommand,
-			"set-option",
-			"-t",
-			buildGjcTmuxExactOptionTarget(sessionName),
-			GJC_TMUX_PROFILE_OPTION,
-			GJC_TMUX_PROFILE_VALUE,
+			...providerExecutableArgv(authority),
+			...buildTmuxProviderCommand(authority, "set-option", [
+				"-t",
+				buildGjcTmuxExactOptionTarget(sessionName, { binary: authority.binary }),
+				GJC_TMUX_PROFILE_OPTION,
+				GJC_TMUX_PROFILE_VALUE,
+			]),
 		],
-		{
-			stdout: "pipe",
-			stderr: "pipe",
-		},
+		{ stdout: "pipe", stderr: "pipe" },
 	);
-	return result.exitCode === 0;
+	if (result.exitCode !== 0) return false;
+	assertGjcTmuxMutationAuthoritySync(authority);
+	return readGjcTmuxProfileValue(authority, sessionName) === GJC_TMUX_PROFILE_VALUE;
 }
 
-function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEnv): GjcTmuxLeaderContext {
-	if (Bun.which(tmuxCommand) === null)
+function readCurrentTmuxLeaderContext(
+	tmuxCommand: string,
+	env: NodeJS.ProcessEnv,
+	authority: ProviderAuthority,
+	verifyProfile = true,
+): GjcTmuxLeaderContext {
+	if (!path.isAbsolute(tmuxCommand) && Bun.which(tmuxCommand) === null)
 		throw new Error(buildTeamTmuxLeaderRequirementMessage(`tmux_not_installed:${tmuxCommand}`));
 	// Prefer the explicit GJC-managed session name propagated by `gjc --tmux`
 	// (GJC_TMUX_ACTIVE_SESSION). Under psmux on Windows the inherited TMUX_PANE
 	// can resolve to the wrong/default session, so querying the tagged session
 	// by name is authoritative for GJC-launched leaders. Fall back to TMUX_PANE,
 	// then to the ambient session, to keep native tmux/WSL flows unchanged.
-	const activeSession = env[GJC_TMUX_ACTIVE_SESSION_ENV]?.trim();
-	const displayTarget = activeSession ? buildGjcTmuxExactOptionTarget(activeSession, { env }) : env.TMUX_PANE?.trim();
+	const activeSession =
+		authority.kind === "windows-psmux" || env.TMUX_PANE?.trim()
+			? env[GJC_TMUX_ACTIVE_SESSION_ENV]?.trim()
+			: undefined;
+	const displayTarget = activeSession
+		? buildGjcTmuxExactOptionTarget(activeSession, { env, binary: authority.binary })
+		: env.TMUX_PANE?.trim();
 	const args = displayTarget
 		? ["display-message", "-p", "-t", displayTarget, "#S:#I #{pane_id}"]
 		: ["display-message", "-p", "#S:#I #{pane_id}"];
-	const result = Bun.spawnSync([tmuxCommand, ...args], {
-		stdout: "pipe",
-		stderr: "pipe",
-	});
+	const result = Bun.spawnSync(
+		[...providerExecutableArgv(authority), ...buildTmuxProviderCommand(authority, args[0]!, args.slice(1))],
+		{
+			stdout: "pipe",
+			env,
+			stderr: "pipe",
+		},
+	);
 	if (result.exitCode !== 0) {
 		// Distinguish "you are not inside any tmux session" from a genuine tmux
 		// query failure so the caller gets actionable guidance instead of raw
@@ -2517,7 +2612,7 @@ function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEn
 	const [sessionName = "", windowIndex = ""] = sessionAndWindow.split(":");
 	if (!sessionName || !windowIndex || !leaderPaneId.startsWith("%"))
 		throw new Error(buildTeamTmuxLeaderRequirementMessage(`invalid_tmux_context:${result.stdout.toString().trim()}`));
-	if (readGjcTmuxProfileValue(tmuxCommand, sessionName) !== GJC_TMUX_PROFILE_VALUE) {
+	if (verifyProfile && readGjcTmuxProfileValue(authority, sessionName) !== GJC_TMUX_PROFILE_VALUE) {
 		// Adopt any real tmux leader as a GJC team leader — including a session
 		// the user created outside `gjc --tmux` — by writing GJC's @gjc-profile
 		// ownership tag and reading it back. A provider that round-trips tmux
@@ -2525,8 +2620,8 @@ function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEn
 		// not (e.g. psmux on Windows) drops it, so the readback still fails and
 		// the leader is rejected as unmanaged. This also self-heals a genuine
 		// `gjc --tmux` pane that lost its @gjc-profile tag mid-startup.
-		const tagged = tagTmuxSessionAsGjcLeader(tmuxCommand, sessionName);
-		if (!tagged || readGjcTmuxProfileValue(tmuxCommand, sessionName) !== GJC_TMUX_PROFILE_VALUE)
+		const tagged = tagTmuxSessionAsGjcLeader(authority, sessionName);
+		if (!tagged || readGjcTmuxProfileValue(authority, sessionName) !== GJC_TMUX_PROFILE_VALUE)
 			throw new Error(
 				buildTeamTmuxLeaderRequirementMessage(
 					`unmanaged_tmux_session:${sessionName} — ${buildGjcTmuxUntaggedSessionHint(tmuxCommand)}`,
@@ -2539,6 +2634,39 @@ function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEn
 		leaderPaneId,
 		target: `${sessionName}:${windowIndex}`,
 	};
+}
+/**
+ * Check whether the current process can launch a team without changing tmux state.
+ * Unlike the launch path, this never adopts or tags an unmanaged tmux session.
+ */
+export function probeGjcTeamAvailability(
+	env: NodeJS.ProcessEnv = process.env,
+): { available: true } | { available: false; reason: string } {
+	try {
+		const stateDir = env[GJC_TMUX_OWNER_STATE_DIR_ENV]?.trim();
+		const sessionId = env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim();
+		const generation = env[GJC_TMUX_OWNER_GENERATION_ENV]?.trim();
+		const authority =
+			stateDir && sessionId && generation && hasGjcTmuxProviderAuthoritySync({ stateDir, sessionId, generation })
+				? readGjcTmuxProviderAuthoritySync({ stateDir, sessionId, generation })
+				: null;
+		const provider = authority ?? resolveGjcTmuxProviderContext({ env });
+		if (provider.binary.isPsmux && !authority) throw new Error("gjc_team_tmux_provider_authority_unavailable");
+		readCurrentTmuxLeaderContext(
+			provider.command,
+			env,
+			authority ??
+				bindGjcTmuxProviderAuthority(provider, {
+					stateDir: process.cwd(),
+					sessionId: "team-probe",
+					generation: "probe",
+				}),
+			false,
+		);
+		return { available: true };
+	} catch (error) {
+		return { available: false, reason: error instanceof Error ? error.message : String(error) };
+	}
 }
 function isBunVirtualPath(candidate: string | undefined): boolean {
 	const normalized = candidate?.trim().replace(/\\/g, "/").toLowerCase();
@@ -2607,8 +2735,12 @@ export function resolveGjcWorkerCommand(
 }
 export { buildWorkerCommand } from "./team-launch";
 
-function shouldDispatchWorkerWithSendKeys(tmuxCommand: string, platform: NodeJS.Platform = process.platform): boolean {
-	return platform === "win32" || path.basename(tmuxCommand).toLowerCase() === "psmux";
+function shouldDispatchWorkerWithSendKeys(tmuxCommand: string, providerGeneration?: string): boolean {
+	const command = path
+		.basename(tmuxCommand)
+		.toLowerCase()
+		.replace(/\.exe$/, "");
+	return Boolean(providerGeneration) || command === "psmux" || command === "pmux";
 }
 
 interface GjcTeamInitialLane {
@@ -2699,6 +2831,181 @@ function buildInitialTasks(task: string, workers: GjcTeamWorker[]): GjcTeamTask[
 	}));
 }
 
+function configuredWindowsTmuxCommandIsNative(command: string): boolean {
+	const normalized = command.trim().replace(/\\/g, "/");
+	const basename = normalized.slice(normalized.lastIndexOf("/") + 1).toLowerCase();
+	return basename === "tmux" || basename === "tmux.exe";
+}
+
+function teamProviderAuthority(config: GjcTeamConfig): ProviderAuthority {
+	if (
+		config.tmux_provider_generation &&
+		hasGjcTmuxProviderAuthoritySync({
+			stateDir: config.tmux_provider_state_dir ?? config.state_root,
+			sessionId: config.tmux_provider_session_id ?? config.team_name,
+			generation: config.tmux_provider_generation,
+		})
+	)
+		return readGjcTmuxProviderAuthoritySync({
+			stateDir: config.tmux_provider_state_dir ?? config.state_root,
+			sessionId: config.tmux_provider_session_id ?? config.team_name,
+			generation: config.tmux_provider_generation,
+		});
+	if (config.tmux_provider_generation && !config.dry_run)
+		throw new Error("gjc_team_tmux_provider_authority_unavailable");
+
+	const binary = resolveGjcTmuxBinary({
+		env: {
+			...process.env,
+			GJC_TMUX_COMMAND: config.tmux_command,
+			GJC_TEAM_TMUX_COMMAND: config.tmux_command,
+		},
+	});
+	const context = resolveGjcTmuxProviderContext({ binary, platform: config.platform ?? process.platform });
+	if (context.kind === "windows-psmux") throw new Error("gjc_team_tmux_provider_authority_unavailable");
+	if ((config.platform ?? process.platform) === "win32" && !configuredWindowsTmuxCommandIsNative(config.tmux_command))
+		throw new Error("gjc_team_tmux_provider_ambiguous");
+	return bindGjcTmuxProviderAuthority(context, {
+		stateDir: config.state_root,
+		sessionId: config.team_name,
+		generation: "native-tmux",
+	});
+}
+
+function teamTmuxArgs(config: GjcTeamConfig, command: string, args: readonly string[] = []): string[] {
+	const authority = teamProviderAuthority(config);
+	return [...providerExecutableArgv(authority), ...buildTmuxProviderCommand(authority, command, args)];
+}
+
+type TeamTmuxMutation =
+	| { type: "split"; direction: string; target: string; cwd: string; command?: string }
+	| {
+			type: "literal-send";
+			paneId: string;
+			text: string;
+			deferredProof: "worker-startup-ack" | "continuation-outcome";
+	  }
+	| { type: "key-send"; paneId: string; key: string; deferredProof: "worker-startup-ack" | "continuation-outcome" }
+	| { type: "layout"; target: string; layout: string }
+	| { type: "set-window-option"; target: string; name: string; value: string }
+	| { type: "kill-pane"; paneId: string }
+	| { type: "profile-option"; target: string; name: string; value: string }
+	| { type: "profile-window-option"; target: string; name: string; value: string };
+
+function readTeamTmuxValue(
+	config: GjcTeamConfig,
+	command: "show-options" | "show-window-options",
+	target: string,
+	name: string,
+): string | undefined {
+	const result = Bun.spawnSync(teamTmuxArgs(config, command, ["-qv", "-t", target, name]), {
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (result.exitCode !== 0) return undefined;
+	return result.stdout.toString().trim();
+}
+function teamTargetExists(config: GjcTeamConfig, target: string): boolean {
+	const result = Bun.spawnSync(teamTmuxArgs(config, "display-message", ["-p", "-t", target, "#S:#I"]), {
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (result.exitCode !== 0) return false;
+	const observed = result.stdout.toString().trim().split(/\s+/)[0];
+	const unprefixed = target.startsWith("=") ? target.slice(1) : target;
+	const expected = unprefixed.endsWith(":") ? `${unprefixed}0` : unprefixed;
+	return observed === expected || (!expected.includes(":") && observed?.startsWith(`${expected}:`) === true);
+}
+
+function assertTeamTmuxMutationPreproof(config: GjcTeamConfig, operation: TeamTmuxMutation): void {
+	if (operation.type === "split") {
+		if (
+			(operation.target !== config.tmux_target || !teamTargetExists(config, operation.target)) &&
+			!probePaneTeamTarget(config, operation.target).belongsToTeamTarget
+		)
+			throw new Error("tmux_split_preproof_failed");
+		return;
+	}
+	if (operation.type === "layout" || operation.type === "set-window-option") {
+		if (operation.target !== config.tmux_target || !teamTargetExists(config, operation.target))
+			throw new Error(`tmux_${operation.type}_session_preproof_failed`);
+		return;
+	}
+	if (operation.type === "profile-option" || operation.type === "profile-window-option") {
+		if (operation.target !== config.tmux_target || !teamTargetExists(config, operation.target))
+			throw new Error(`tmux_${operation.type}_session_preproof_failed`);
+		return;
+	}
+	const pane = probePaneTeamTarget(config, operation.paneId);
+	if (operation.type === "kill-pane" ? !pane.exists || !pane.belongsToTeamTarget : !pane.belongsToTeamTarget)
+		throw new Error(`tmux_${operation.type}_preproof_failed`);
+	// Delivery is proven asynchronously by the generation-bound worker startup ACK
+	// or continuation outcome named in the closed operation variant. Exit status
+	// alone is never treated as delivery proof.
+}
+
+function executeTeamTmuxMutation(
+	config: GjcTeamConfig,
+	operation: TeamTmuxMutation,
+): Bun.SyncSubprocess<"pipe", "pipe"> {
+	const authority = teamProviderAuthority(config);
+	assertTeamTmuxMutationPreproof(config, operation);
+	const args =
+		operation.type === "split"
+			? [
+					"split-window",
+					operation.direction,
+					"-t",
+					operation.target,
+					"-d",
+					"-P",
+					"-F",
+					"#{pane_id}",
+					"-c",
+					operation.cwd,
+					...(operation.command ? [operation.command] : []),
+				]
+			: operation.type === "literal-send"
+				? ["send-keys", "-l", "-t", operation.paneId, operation.text]
+				: operation.type === "key-send"
+					? ["send-keys", "-t", operation.paneId, operation.key]
+					: operation.type === "layout"
+						? ["select-layout", "-t", operation.target, operation.layout]
+						: operation.type === "set-window-option" || operation.type === "profile-window-option"
+							? ["set-window-option", "-t", operation.target, operation.name, operation.value]
+							: operation.type === "kill-pane"
+								? ["kill-pane", "-t", operation.paneId]
+								: ["set-option", "-t", operation.target, operation.name, operation.value];
+	assertGjcTmuxMutationAuthoritySync(authority);
+	const result = Bun.spawnSync(
+		[...providerExecutableArgv(authority), ...buildTmuxProviderCommand(authority, args[0]!, args.slice(1))],
+		{ stdout: "pipe", stderr: "pipe" },
+	);
+	if (result.exitCode !== 0 && operation.type !== "kill-pane")
+		throw new Error(result.stderr.toString().trim() || `tmux_${operation.type}_failed`);
+	assertGjcTmuxMutationAuthoritySync(authority);
+	if (operation.type === "split") {
+		const paneId = result.stdout.toString().trim().split(/\r?\n/)[0]?.trim() ?? "";
+		if (!paneId.startsWith("%") || !probePaneTeamTarget(config, paneId).belongsToTeamTarget)
+			throw new Error("tmux_split_postproof_failed");
+	} else if (operation.type === "kill-pane") {
+		if (probePaneTeamTarget(config, operation.paneId).exists) throw new Error("tmux_kill_postproof_failed");
+	} else if (operation.type === "layout") {
+		const layout = Bun.spawnSync(
+			teamTmuxArgs(config, "display-message", ["-p", "-t", operation.target, "#{window_layout}"]),
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		if (layout.exitCode !== 0 || layout.stdout.toString().trim() !== operation.layout)
+			throw new Error("tmux_layout_postproof_failed");
+	} else if (operation.type === "set-window-option" || operation.type === "profile-window-option") {
+		if (readTeamTmuxValue(config, "show-window-options", operation.target, operation.name) !== operation.value)
+			throw new Error("tmux_window_option_postproof_failed");
+	} else if (operation.type === "profile-option") {
+		if (readTeamTmuxValue(config, "show-options", operation.target, operation.name) !== operation.value)
+			throw new Error("tmux_profile_option_postproof_failed");
+	}
+	return result;
+}
 async function startTmuxSession(
 	config: GjcTeamConfig,
 	dir: string,
@@ -2718,26 +3025,19 @@ async function startTmuxSession(
 			const splitDirection: string = worker.index === 1 ? "-h" : "-v";
 			const splitTarget: string =
 				worker.index === 1 ? config.tmux_target : (rightStackRootPaneId ?? config.tmux_target);
-			const workerCommand = buildWorkerCommand(config, worker);
+			const workerCommand = buildWorkerCommand(config, worker, process.platform, undefined, env);
 			const workerCwd = worker.worktree_path ?? config.leader.cwd;
-			const useSendKeysFallback = shouldDispatchWorkerWithSendKeys(config.tmux_command);
-			const splitArgs = [
+			const useSendKeysFallback = shouldDispatchWorkerWithSendKeys(
 				config.tmux_command,
-				"split-window",
-				splitDirection,
-				"-t",
-				splitTarget,
-				"-d",
-				"-P",
-				"-F",
-				"#{pane_id}",
-				"-c",
-				workerCwd,
-				...(useSendKeysFallback ? [] : [workerCommand]),
-			];
-			const split: Bun.SyncSubprocess<"pipe", "pipe"> = Bun.spawnSync(splitArgs, { stdout: "pipe", stderr: "pipe" });
-			if (split.exitCode !== 0)
-				throw new Error(split.stderr.toString().trim() || `tmux_split_failed:${config.tmux_target}:${worker.id}`);
+				config.tmux_provider_generation,
+			);
+			const split = executeTeamTmuxMutation(config, {
+				type: "split",
+				direction: splitDirection,
+				target: splitTarget,
+				cwd: workerCwd,
+				...(useSendKeysFallback ? {} : { command: workerCommand }),
+			});
 			const paneId: string = split.stdout.toString().trim().split(/\r?\n/)[0]?.trim() ?? "";
 			if (!paneId.startsWith("%")) throw new Error(`tmux_split_missing_pane:${config.tmux_target}:${worker.id}`);
 			rollbackPaneIds.push(paneId);
@@ -2754,53 +3054,71 @@ async function startTmuxSession(
 				// "Enter" as literal text too. Sending the body in literal mode first and
 				// the Enter keypress second keeps the body verbatim while still submitting
 				// the prompt as a keystroke.
-				Bun.spawnSync([config.tmux_command, "send-keys", "-l", "-t", paneId, workerCommand], {
-					stdout: "ignore",
-					stderr: "ignore",
+				executeTeamTmuxMutation(config, {
+					type: "literal-send",
+					paneId,
+					text: workerCommand,
+					deferredProof: "worker-startup-ack",
 				});
-				const sendKeys = Bun.spawnSync([config.tmux_command, "send-keys", "-t", paneId, "Enter"], {
-					stdout: "ignore",
-					stderr: "ignore",
+				executeTeamTmuxMutation(config, {
+					type: "key-send",
+					paneId,
+					key: "Enter",
+					deferredProof: "worker-startup-ack",
 				});
-				// void-cast the exit code so the linter does not flag an unused expression;
-				// the value is intentionally discarded here because the actual spawn outcome
-				// is recovered by the leader through the worker startup-ack watcher, not via
-				// the spawn exit code.
-				void sendKeys.exitCode;
 			}
 		}
-		Bun.spawnSync([config.tmux_command, "select-layout", "-t", config.tmux_target, "main-vertical"], {
-			stdout: "ignore",
-			stderr: "ignore",
-		});
+		executeTeamTmuxMutation(config, { type: "layout", target: config.tmux_target, layout: "main-vertical" });
 		const widthResult = Bun.spawnSync(
-			[config.tmux_command, "display-message", "-p", "-t", config.tmux_target, "#{window_width}"],
+			teamTmuxArgs(config, "display-message", ["-p", "-t", config.tmux_target, "#{window_width}"]),
 			{ stdout: "pipe", stderr: "ignore" },
 		);
 		const width = Number.parseInt(widthResult.stdout.toString().trim(), 10);
 		if (Number.isFinite(width) && width >= 40) {
-			Bun.spawnSync(
-				[
-					config.tmux_command,
-					"set-window-option",
-					"-t",
-					config.tmux_target,
-					"main-pane-width",
-					String(Math.floor(width / 2)),
-				],
-				{ stdout: "ignore", stderr: "ignore" },
-			);
-			Bun.spawnSync([config.tmux_command, "select-layout", "-t", config.tmux_target, "main-vertical"], {
-				stdout: "ignore",
-				stderr: "ignore",
+			executeTeamTmuxMutation(config, {
+				type: "set-window-option",
+				target: config.tmux_target,
+				name: "main-pane-width",
+				value: String(Math.floor(width / 2)),
 			});
+			executeTeamTmuxMutation(config, { type: "layout", target: config.tmux_target, layout: "main-vertical" });
 		}
-		const profileResult = applyGjcTmuxProfile({
-			tmuxCommand: config.tmux_command,
-			target: config.tmux_target,
-			cwd: config.leader.cwd,
+		const profileCommands = buildGjcTmuxProfileCommands(
+			config.tmux_target,
 			env,
+			{},
+			{
+				tmuxCommand: config.tmux_command,
+			},
+		);
+		const profileFailures = profileCommands.filter(command => {
+			const [kind, targetFlag, target, name, value] = command.args;
+			if (
+				(kind !== "set-option" && kind !== "set-window-option") ||
+				targetFlag !== "-t" ||
+				!target ||
+				!name ||
+				value === undefined ||
+				command.args.length !== 5
+			)
+				return true;
+			try {
+				executeTeamTmuxMutation(config, {
+					type: kind === "set-option" ? "profile-option" : "profile-window-option",
+					target,
+					name,
+					value,
+				});
+				return false;
+			} catch {
+				return true;
+			}
 		});
+		const profileResult = {
+			skipped: false,
+			commands: profileCommands,
+			failures: profileFailures,
+		};
 		await appendTelemetry(dir, {
 			type: "tmux_profile_applied",
 			message: profileResult.skipped
@@ -2822,11 +3140,13 @@ async function startTmuxSession(
 		});
 		return workers;
 	} catch (error) {
-		for (const paneId of rollbackPaneIds)
-			Bun.spawnSync([config.tmux_command, "kill-pane", "-t", paneId], {
-				stdout: "ignore",
-				stderr: "ignore",
-			});
+		for (const paneId of rollbackPaneIds) {
+			try {
+				executeTeamTmuxMutation(config, { type: "kill-pane", paneId });
+			} catch {
+				// Preserve the original launch failure while making a best-effort cleanup.
+			}
+		}
 		throw error;
 	}
 }
@@ -2836,7 +3156,7 @@ function probePaneTeamTarget(
 ): { exists: boolean; belongsToTeamTarget: boolean; pid?: number } {
 	if (paneId === config.leader.pane_id) return { exists: true, belongsToTeamTarget: false };
 	const result = Bun.spawnSync(
-		[config.tmux_command, "display-message", "-p", "-t", paneId, "#S:#I #{pane_id} #{pane_pid}"],
+		teamTmuxArgs(config, "display-message", ["-p", "-t", paneId, "#S:#I #{pane_id} #{pane_pid}"]),
 		{ stdout: "pipe", stderr: "ignore" },
 	);
 	if (result.exitCode !== 0) return { exists: false, belongsToTeamTarget: false };
@@ -2855,10 +3175,7 @@ function paneBelongsToTeamTarget(config: GjcTeamConfig, paneId: string): boolean
 function killWorkerPanes(config: GjcTeamConfig): void {
 	for (const worker of config.workers)
 		if (worker.pane_id?.startsWith("%") && paneBelongsToTeamTarget(config, worker.pane_id))
-			Bun.spawnSync([config.tmux_command, "kill-pane", "-t", worker.pane_id], {
-				stdout: "ignore",
-				stderr: "ignore",
-			});
+			executeTeamTmuxMutation(config, { type: "kill-pane", paneId: worker.pane_id });
 }
 async function rollbackCreatedWorktrees(workers: GjcTeamWorker[]): Promise<void> {
 	for (const worker of workers.filter(worker => worker.worktree_created).reverse())
@@ -3801,6 +4118,11 @@ async function validateGjcContinuationEligibility(
 	staleMs: number,
 	env: NodeJS.ProcessEnv,
 	reservedHoldUntil?: string,
+	// Revalidation runs after the dispatch fence has been released once for the
+	// reservation write, so a non-claim task edit can legitimately land in between
+	// and bump `version`. Claim identity — owner, token, lease — is what authorizes
+	// continuation; a version bump alone is not a claim change.
+	allowVersionDrift = false,
 ): Promise<string | null> {
 	const phase = await readContinuationJson<Record<string, unknown>>(path.join(dir, "phase.json"));
 	if (
@@ -3840,7 +4162,7 @@ async function validateGjcContinuationEligibility(
 	if (
 		!authority.valid ||
 		authority.task.id !== task.id ||
-		authority.task.version !== task.version ||
+		(!allowVersionDrift && authority.task.version !== task.version) ||
 		authority.task.claim?.owner !== task.claim?.owner ||
 		authority.task.claim?.token !== task.claim?.token ||
 		authority.task.claim?.leased_until !== task.claim?.leased_until
@@ -3851,9 +4173,62 @@ async function validateGjcContinuationEligibility(
 	if (!Number.isFinite(leaseUntil) || leaseUntil <= currentTimeMs()) return "invalid_or_expired_lease";
 	if (holdUntil !== undefined && (!Number.isFinite(holdUntil) || leaseUntil < holdUntil))
 		return "lease_does_not_cover_hold";
-	if (reservedHoldUntil !== undefined && shouldDispatchWorkerWithSendKeys(config.tmux_command))
-		return "unsupported_send_keys_transport";
 	return null;
+}
+async function validateGjcContinuationAckAuthority(
+	dir: string,
+	config: GjcTeamConfig,
+	worker: GjcTeamWorker,
+	task: GjcTeamTask,
+	heartbeatAt: string,
+	staleMs: number,
+	env: NodeJS.ProcessEnv,
+	reservation: Record<string, unknown>,
+	incident: string,
+	attempt: number,
+): Promise<string | null> {
+	let currentConfig: GjcTeamConfig;
+	try {
+		currentConfig = await readConfig(dir);
+	} catch {
+		return "invalid_config_authority";
+	}
+	try {
+		assertGjcTmuxMutationAuthoritySync(teamProviderAuthority(currentConfig));
+	} catch {
+		return "provider_authority_changed";
+	}
+	const currentWorker = currentConfig.workers.find(candidate => candidate.id === worker.id);
+	if (
+		!currentWorker?.pane_id ||
+		currentConfig.team_name !== config.team_name ||
+		currentWorker.pane_id !== reservation.pane_id ||
+		!isValidGjcContinuationReservation(
+			reservation,
+			incident,
+			attempt,
+			currentConfig,
+			worker.id,
+			task,
+			task.claim!,
+			heartbeatAt,
+			currentWorker.pane_id,
+		)
+	)
+		return "reservation_authority_changed";
+	const reason = await validateGjcContinuationEligibility(
+		dir,
+		currentConfig,
+		currentWorker,
+		task,
+		heartbeatAt,
+		staleMs,
+		env,
+	);
+	if (reason) return reason;
+	const lifecycle = (await readLifecycleById(workerRuntime, dir, currentConfig))[worker.id];
+	const incarnation = `${currentWorker.pane_id ?? ""}:${lifecycle?.started_at ?? lifecycle?.updated_at}`;
+	return incarnation === reservation.worker_incarnation ? null : "worker_incarnation_changed";
 }
 function normalizeGjcContinuationDispatchError(value: unknown, fallback: string, maxLength: number): string {
 	try {
@@ -4014,12 +4389,12 @@ async function continueStalledGjcTeamWorkers(
 				)
 			)
 				continue;
-			if (
-				!isValidGjcContinuationOutcome(firstOutcome, firstReservation, incident, 1) ||
-				firstOutcome.result !== "sent"
-			)
-				continue;
-			const firstHold = Date.parse(String(firstOutcome.hold_until));
+			if (!isValidGjcContinuationOutcome(firstOutcome, firstReservation, incident, 1)) continue;
+			const firstAck = await readContinuationJson<Record<string, unknown>>(
+				path.join(journalDir, "attempt-01.ack.json"),
+			);
+			if (!isValidGjcContinuationAck(firstAck, firstReservation, incident, 1)) continue;
+			const firstHold = Date.parse(String(firstReservation.hold_until));
 			const leaseUntil = Date.parse(task.claim.leased_until);
 			if (
 				!Number.isFinite(firstHold) ||
@@ -4050,90 +4425,211 @@ async function continueStalledGjcTeamWorkers(
 			leased_until: task.claim.leased_until,
 			heartbeat_at: heartbeat.last_turn_at,
 			pane_id: worker.pane_id,
+			worker_incarnation: `${worker.pane_id}:${lifecycle.started_at ?? lifecycle.updated_at}`,
 			tmux_target: config.tmux_target,
 			attempt,
+			attempt_nonce: randomUUID(),
 			reserved_at: reservedAt,
 			hold_until: holdUntil,
 			prompt_version: 1,
-			prompt_sha256: createHash("sha256").update(GJC_TEAM_CONTINUATION_PROMPT).digest("hex"),
+			prompt_sha256: "",
 			dispatch_protocol: "tmux_command_sequence_v1",
 		};
+		const continuationPrompt = buildGjcContinuationPrompt(reservation);
+		reservation.prompt_sha256 = createHash("sha256").update(continuationPrompt).digest("hex");
 		const reservationPath = path.join(journalDir, `attempt-0${attempt}.reservation.json`);
+		let reservationSkipReason: string | null = null;
 		try {
-			await createJsonNoClobber(
-				reservationPath,
-				reservation,
-				stateWriterOptions(reservationPath, "state", "continuation-reservation"),
-			);
+			await withGjcTeamTaskMutation(taskStore(dir), async () => {
+				const reservationReason = await validateGjcContinuationEligibility(
+					dir,
+					config,
+					worker,
+					task,
+					heartbeat.last_turn_at,
+					staleMs,
+					env,
+					new Date(currentTimeMs() + GJC_TEAM_CONTINUATION_DISPATCH_TIMEOUT_MS + holdMs).toISOString(),
+				);
+				if (reservationReason) {
+					// An ineligible reservation must not abort the monitor pass for every other
+					// worker. Record the same auditable `skipped` outcome the post-dispatch
+					// revalidation site records, so a short or changed lease is journalled
+					// rather than thrown out of `monitorGjcTeam`.
+					reservationSkipReason = reservationReason;
+					const skippedPath = path.join(journalDir, `attempt-0${attempt}.outcome.json`);
+					await createJsonNoClobber(
+						skippedPath,
+						{
+							schema_version: 1,
+							incident_hash: incident,
+							attempt,
+							reservation_sha256: gjcContinuationReservationDigest(reservation),
+							recorded_at: now(),
+							result: "skipped",
+							reason: reservationReason,
+						},
+						stateWriterOptions(skippedPath, "state", "continuation-outcome"),
+					);
+					return;
+				}
+				await createJsonNoClobber(
+					reservationPath,
+					reservation,
+					stateWriterOptions(reservationPath, "state", "continuation-reservation"),
+				);
+			});
 		} catch (error) {
 			if (error instanceof AlreadyExistsError) continue;
 			throw error;
 		}
+		if (reservationSkipReason !== null) return;
 		let result: "sent" | "unknown" = "unknown";
 		let outcomeReason = "tmux_missing_exit_code";
 		let tmuxExitCode: number | undefined;
 		let tmuxError: { name: string; code?: string; message: string } | undefined;
 		let dispatchedAt: string | undefined;
 		let dispatchHoldUntil: string | undefined;
-		if (gjcTeamRuntimeTestSeams?.continuationBeforeDispatch)
-			await gjcTeamRuntimeTestSeams.continuationBeforeDispatch();
-		const revalidationReason = await validateGjcContinuationEligibility(
-			dir,
-			config,
-			worker,
-			task,
-			heartbeat.last_turn_at,
-			staleMs,
-			env,
-			new Date(currentTimeMs() + GJC_TEAM_CONTINUATION_DISPATCH_TIMEOUT_MS + holdMs).toISOString(),
-		);
-		if (revalidationReason) {
-			const skippedPath = path.join(journalDir, `attempt-0${attempt}.outcome.json`);
-			await createJsonNoClobber(
-				skippedPath,
-				{
-					schema_version: 1,
-					incident_hash: incident,
-					attempt,
-					reservation_sha256: gjcContinuationReservationDigest(reservation),
-					recorded_at: now(),
-					result: "skipped",
-					reason: revalidationReason,
-				},
-				stateWriterOptions(skippedPath, "state", "continuation-outcome"),
+		// The reservation above was written under the task lock, and that lock is
+		// released before dispatch. Revalidation plus send-keys is therefore its own
+		// critical section, and it must exclude concurrent claim mutation: otherwise a
+		// claim-releasing operation (worker GC prune, stale-claim recovery) lands in
+		// the gap, revalidation observes no current claim, and the incident is
+		// journalled `skipped` with no continuation dispatched at all.
+		//
+		// Take the same team mutation fence every public authority-changing operation
+		// takes, and release it before the ACK wait. The ACK is published by a
+		// separate receiver process that must acquire the same cross-process fence,
+		// so holding it across the wait would deadlock the very ACK being awaited.
+		const attemptOutcome = await withGjcTeamMutationFence(dir, async () => {
+			if (gjcTeamRuntimeTestSeams?.continuationBeforeDispatch)
+				await gjcTeamRuntimeTestSeams.continuationBeforeDispatch();
+			const revalidationReason = await validateGjcContinuationEligibility(
+				dir,
+				config,
+				worker,
+				task,
+				heartbeat.last_turn_at,
+				staleMs,
+				env,
+				new Date(currentTimeMs() + GJC_TEAM_CONTINUATION_DISPATCH_TIMEOUT_MS + holdMs).toISOString(),
+
+				true,
 			);
+			if (revalidationReason) return { kind: "skipped" as const, reason: revalidationReason };
+			// Eligibility validation above proves the worker owns a real pane, but that
+			// runtime proof does not narrow the optional `pane_id` field for the type
+			// checker. Bind it to a proven non-empty local and dispatch through that, so
+			// the frozen argv is `readonly string[]` and both send operations address the
+			// identical pane. A missing pane id here is an eligibility gap, not a
+			// dispatch error, so report it as the same typed skipped outcome.
+			const paneId = worker.pane_id;
+			if (!paneId) return { kind: "skipped" as const, reason: "worker_pane_missing" };
+			try {
+				const args: readonly string[] = Object.freeze([
+					"send-keys",
+					"-l",
+					"-t",
+					paneId,
+					continuationPrompt,
+					";",
+					"send-keys",
+					"-t",
+					paneId,
+					"Enter",
+				]);
+				const dispatch = await (gjcTeamRuntimeTestSeams?.continuationTmuxDispatch
+					? gjcTeamRuntimeTestSeams.continuationTmuxDispatch(config.tmux_command, args)
+					: (() => {
+							executeTeamTmuxMutation(config, {
+								type: "literal-send",
+								paneId,
+								text: continuationPrompt,
+								deferredProof: "continuation-outcome",
+							});
+							return executeTeamTmuxMutation(config, {
+								type: "key-send",
+								paneId,
+								key: "Enter",
+								deferredProof: "continuation-outcome",
+							});
+						})());
+				return { kind: "dispatched" as const, exitCode: dispatch.exitCode };
+			} catch (error) {
+				return { kind: "threw" as const, error };
+			}
+		});
+		if (attemptOutcome.kind === "skipped") {
+			const skippedPath = path.join(journalDir, `attempt-0${attempt}.outcome.json`);
+			await withGjcTeamTaskMutation(taskStore(dir), async () => {
+				await createJsonNoClobber(
+					skippedPath,
+					{
+						schema_version: 1,
+						incident_hash: incident,
+						attempt,
+						reservation_sha256: gjcContinuationReservationDigest(reservation),
+						recorded_at: now(),
+						result: "skipped",
+						reason: attemptOutcome.reason,
+					},
+					stateWriterOptions(skippedPath, "state", "continuation-outcome"),
+				);
+			});
 			return;
 		}
 		try {
-			const args = Object.freeze([
-				"send-keys",
-				"-l",
-				"-t",
-				worker.pane_id,
-				GJC_TEAM_CONTINUATION_PROMPT,
-				";",
-				"send-keys",
-				"-t",
-				worker.pane_id,
-				"Enter",
-			]);
-			const dispatch = gjcTeamRuntimeTestSeams?.continuationTmuxDispatch
-				? gjcTeamRuntimeTestSeams.continuationTmuxDispatch(config.tmux_command, args)
-				: Bun.spawnSync([config.tmux_command, ...args], {
-						stdout: "ignore",
-						stderr: "ignore",
-						timeout: GJC_TEAM_CONTINUATION_DISPATCH_TIMEOUT_MS,
-					});
-			const dispatchAtMs = currentTimeMs();
-			tmuxExitCode = dispatch.exitCode;
-			if (dispatch.exitCode === 0) {
-				result = "sent";
-				outcomeReason = "tmux_sent";
-				dispatchedAt = new Date(dispatchAtMs).toISOString();
-				dispatchHoldUntil = new Date(dispatchAtMs + holdMs).toISOString();
-			} else if (typeof dispatch.exitCode === "number") {
-				outcomeReason = "tmux_nonzero_exit";
-			}
+			if (attemptOutcome.kind === "threw") throw attemptOutcome.error;
+			tmuxExitCode = attemptOutcome.exitCode;
+			if (attemptOutcome.exitCode === 0) {
+				// Bound the ack wait on the seamed clock so a test that advances `nowMs`
+				// exhausts the dispatch budget deterministically instead of sleeping.
+				// The wait loop advances EITHER the seamed clock (a test-supplied
+				// continuationAckPoll) OR wall time (the real Bun.sleep below). Bounding
+				// only one lets the other run forever: with a frozen fake clock and no ack
+				// seam, a seamed-only deadline never trips. Bound both.
+				const ackDeadline = currentTimeMs() + GJC_TEAM_CONTINUATION_DISPATCH_TIMEOUT_MS;
+				const ackWallDeadline = Date.now() + GJC_TEAM_CONTINUATION_DISPATCH_TIMEOUT_MS;
+				while (true) {
+					const ackAuthorityReason = await validateGjcContinuationAckAuthority(
+						dir,
+						config,
+						worker,
+						task,
+						heartbeat.last_turn_at,
+						staleMs,
+						env,
+						reservation,
+						incident,
+						attempt,
+					);
+					if (ackAuthorityReason) {
+						outcomeReason = `continuation_${ackAuthorityReason}`;
+						break;
+					}
+					const ack = await readContinuationJson<Record<string, unknown>>(
+						path.join(journalDir, `attempt-0${attempt}.ack.json`),
+					);
+					if (isValidGjcContinuationAck(ack, reservation, incident, attempt)) {
+						result = "sent";
+						outcomeReason = "tmux_sent";
+						dispatchedAt = now();
+						dispatchHoldUntil = new Date(
+							Date.parse(dispatchedAt) + (attempt === 1 ? 30_000 : 120_000),
+						).toISOString();
+						break;
+					}
+					if (currentTimeMs() >= ackDeadline || Date.now() >= ackWallDeadline) {
+						outcomeReason = "tmux_exit_zero_unacknowledged";
+						break;
+					}
+					if (gjcTeamRuntimeTestSeams?.continuationAckPoll) {
+						await gjcTeamRuntimeTestSeams.continuationAckPoll();
+					} else {
+						await Bun.sleep(GJC_TEAM_CONTINUATION_ACK_POLL_MS);
+					}
+				}
+			} else if (typeof attemptOutcome.exitCode === "number") outcomeReason = "tmux_nonzero_exit";
 		} catch (error) {
 			outcomeReason = "tmux_dispatch_threw";
 			const name = normalizeGjcContinuationDispatchError(
@@ -4157,31 +4653,58 @@ async function continueStalledGjcTeamWorkers(
 			};
 		}
 		const outcomePath = path.join(journalDir, `attempt-0${attempt}.outcome.json`);
-		try {
-			await createJsonNoClobber(
-				outcomePath,
-				{
-					schema_version: 1,
-					incident_hash: incident,
+		await withGjcTeamTaskMutation(taskStore(dir), async () => {
+			if (result === "sent") {
+				const outcomeAuthorityReason = await validateGjcContinuationAckAuthority(
+					dir,
+					config,
+					worker,
+					task,
+					heartbeat.last_turn_at,
+					staleMs,
+					env,
+					reservation,
+					incident,
 					attempt,
-					reservation_sha256: gjcContinuationReservationDigest(reservation),
-					recorded_at: now(),
-					result,
-					reason: outcomeReason,
-					...(tmuxExitCode === undefined ? {} : { tmux_exit_code: tmuxExitCode }),
-					...(dispatchedAt === undefined || dispatchHoldUntil === undefined
-						? {}
-						: { dispatched_at: dispatchedAt, hold_until: dispatchHoldUntil }),
-					...(tmuxError ? { tmux_error: tmuxError } : {}),
-				},
-				stateWriterOptions(outcomePath, "state", "continuation-outcome"),
-			);
-		} catch (error) {
-			if (!(error instanceof AlreadyExistsError)) throw error;
-			const existing = await readContinuationJson<Record<string, unknown>>(outcomePath);
-			if (!isValidGjcContinuationOutcome(existing, reservation, incident, attempt))
-				throw new Error(`invalid_continuation_outcome:${incident}:${attempt}`);
-		}
+				);
+				const ack = await readContinuationJson<Record<string, unknown>>(
+					path.join(journalDir, `attempt-0${attempt}.ack.json`),
+				);
+				if (outcomeAuthorityReason || !isValidGjcContinuationAck(ack, reservation, incident, attempt)) {
+					result = "unknown";
+					outcomeReason = outcomeAuthorityReason
+						? `continuation_${outcomeAuthorityReason}`
+						: "tmux_exit_zero_unacknowledged";
+					dispatchedAt = undefined;
+					dispatchHoldUntil = undefined;
+				}
+			}
+			try {
+				await createJsonNoClobber(
+					outcomePath,
+					{
+						schema_version: 1,
+						incident_hash: incident,
+						attempt,
+						reservation_sha256: gjcContinuationReservationDigest(reservation),
+						recorded_at: now(),
+						result,
+						reason: outcomeReason,
+						...(tmuxExitCode === undefined ? {} : { tmux_exit_code: tmuxExitCode }),
+						...(result === "sent" && dispatchedAt && dispatchHoldUntil
+							? { dispatched_at: dispatchedAt, hold_until: dispatchHoldUntil }
+							: {}),
+						...(tmuxError ? { tmux_error: tmuxError } : {}),
+					},
+					stateWriterOptions(outcomePath, "state", "continuation-outcome"),
+				);
+			} catch (error) {
+				if (!(error instanceof AlreadyExistsError)) throw error;
+				const existing = await readContinuationJson<Record<string, unknown>>(outcomePath);
+				if (!isValidGjcContinuationOutcome(existing, reservation, incident, attempt))
+					throw new Error(`invalid_continuation_outcome:${incident}:${attempt}`);
+			}
+		});
 		return;
 	}
 }
@@ -4194,9 +4717,9 @@ export async function monitorGjcTeam(
 	const dir = await findTeamDir(teamName, cwd, env);
 	const config = await readConfig(dir);
 	const previous = await readJsonFile<GjcTeamMonitorSnapshot>(monitorSnapshotPath(dir));
+	await continueStalledGjcTeamWorkers(dir, config, env);
 	await withGjcTeamTaskMutation(taskStore(dir), async capability => {
 		const config = await readConfig(dir);
-		await continueStalledGjcTeamWorkers(dir, config, env);
 		await reconcileGjcTeamStaleClaimsUnlocked(workerOrchestrationRuntime, teamName, dir, config, env, capability);
 		await computeLifecycleNudges(config, dir, cwd, env);
 	});
@@ -4240,6 +4763,15 @@ async function writeGjcWorkerStartupAck(
 ): Promise<Record<string, unknown>> {
 	return writeWorkerStartupAck(workerRuntime, teamName, worker, cwd, env, input);
 }
+async function writeGjcWorkerContinuationAck(
+	teamName: string,
+	worker: string,
+	cwd: string,
+	env: NodeJS.ProcessEnv,
+	input: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+	return writeWorkerContinuationAck(workerRuntime, teamName, worker, cwd, env, input);
+}
 function parseDurationEnv(env: NodeJS.ProcessEnv, name: string, fallbackMs: number): number {
 	const raw = env[name]?.trim();
 	if (!raw) return fallbackMs;
@@ -4247,11 +4779,13 @@ function parseDurationEnv(env: NodeJS.ProcessEnv, name: string, fallbackMs: numb
 	return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallbackMs;
 }
 
-function parseHeartbeatStaleMs(env: NodeJS.ProcessEnv): number {
+/** Positive stale windows are clamped so a worker can publish strictly before expiry. */
+export function parseHeartbeatStaleMs(env: NodeJS.ProcessEnv): number {
 	const raw = env.GJC_TEAM_HEARTBEAT_STALE_MS?.trim();
 	if (!raw) return 120_000;
 	const parsed = Number(raw);
-	return Number.isFinite(parsed) ? parsed : 120_000;
+	if (!Number.isFinite(parsed)) return 120_000;
+	return parsed > 0 ? Math.max(3, parsed) : parsed;
 }
 async function writeLifecycleNudge(
 	dir: string,
@@ -4751,6 +5285,41 @@ export async function updateGjcWorkerHeartbeat(
 		updateWorkerHeartbeat(workerRuntime, teamName, worker, heartbeat, cwd, env),
 	);
 }
+/**
+ * Refresh liveness without discarding metadata written by other heartbeat
+ * producers. The read/merge/write sequence shares the team mutation fence with
+ * CLI heartbeat updates, so a runtime tick cannot overwrite a newer turn count.
+ */
+export async function refreshGjcWorkerHeartbeat(
+	teamName: string,
+	worker: string,
+	pid: number,
+	cwd = process.cwd(),
+	env: NodeJS.ProcessEnv = process.env,
+): Promise<WorkerHeartbeatFile> {
+	const dir = await findTeamDir(teamName, cwd, env);
+	return withGjcTeamMutationFence(dir, async () => {
+		const current = await readWorkerHeartbeat(workerRuntime, teamName, worker, cwd, env);
+		const processStartTime = await readLinuxProcessStartTime(pid);
+		const turnCount = current?.turn_count;
+		return updateWorkerHeartbeat(
+			workerRuntime,
+			teamName,
+			worker,
+			{
+				...current,
+				pid,
+				last_turn_at: now(),
+				turn_count: Number.isSafeInteger(turnCount) && (turnCount ?? -1) >= 0 ? (turnCount ?? 0) : 0,
+				alive: true,
+				// Never carry another process's incarnation across a pid change.
+				process_start_time: processStartTime ?? (current?.pid === pid ? current.process_start_time : undefined),
+			},
+			cwd,
+			env,
+		);
+	});
+}
 export async function writeGjcWorkerInbox(
 	teamName: string,
 	worker: string,
@@ -4896,12 +5465,13 @@ export async function executeGjcTeamApiOperation(
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<unknown> {
+	const resolvedOperation = resolveGjcTeamApiOperation(operation);
 	const teamName = String(input.team_name ?? input.teamName ?? "").trim();
 	if (!teamName) throw new Error("missing_team_name");
 	const workerInput = input.worker ?? input.worker_id ?? input.workerId;
 	const worker = String(workerInput ?? "worker-1");
 	const explicitWorker = workerInput == null ? undefined : String(workerInput);
-	switch (operation) {
+	switch (resolvedOperation) {
 		case "list-tasks":
 			return { tasks: await listGjcTeamTasks(teamName, cwd, env) };
 		case "read-task":
@@ -5076,6 +5646,8 @@ export async function executeGjcTeamApiOperation(
 		}
 		case "worker-startup-ack":
 			return writeGjcWorkerStartupAck(teamName, worker, cwd, env, input);
+		case "worker-continuation-ack":
+			return writeGjcWorkerContinuationAck(teamName, worker, cwd, env, input);
 		case "read-config":
 			return await readConfig(await findTeamDir(teamName, cwd, env));
 		case "read-manifest":
@@ -5247,7 +5819,8 @@ export async function executeGjcTeamApiOperation(
 		case "read-shutdown-ack":
 			return readGjcShutdownAck(teamName, worker, cwd, env);
 		default:
-			throw new Error(`unknown_team_api_operation:${operation}`);
+			resolvedOperation satisfies never;
+			throw new UnknownGjcTeamApiOperationError(operation, []);
 	}
 }
 

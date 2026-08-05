@@ -5,11 +5,19 @@ import {
 	CURSOR_MARKER,
 	DEFAULT_WHEEL_LINES,
 	Editor,
+	encodeKittyPlacementDelete,
+	extractKittyPlacementReferences,
+	getCellDimensions,
+	Image,
 	ImageProtocol,
 	Markdown,
 	renderComponentWithViewportAnchors,
+	resetKittyTransmissions,
+	setCellDimensions,
+	setKittyTransmitWriter,
 	setTerminalImageProtocol,
 	shouldUseViewportRepaintForHost,
+	shouldUseViewportRepaintForTerminal,
 	TERMINAL,
 	Text,
 	TUI,
@@ -1104,7 +1112,6 @@ describe("registered viewport anchor", () => {
 			"GJC_TMUX_LAUNCHED",
 			"TERMUX_VERSION",
 			"PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER",
-			"PI_CLEAR_ON_SHRINK",
 			"PI_TUI_VIRTUAL_VIEWPORT",
 		] as const;
 		const previous = new Map<string, string | undefined>(envKeys.map(key => [key, Bun.env[key]]));
@@ -1174,43 +1181,34 @@ describe("registered viewport anchor", () => {
 				"editor",
 			]);
 			transcript.setLine(8, "transcript-8 final");
-			for (const clearOnShrink of [false, true]) {
-				if (clearOnShrink) {
-					transient.replace(Array.from({ length: 6 }, (_value, index) => `transient-${index}`));
-					synthetic.replace(Array.from({ length: 4 }, (_value, index) => `synthetic-${index}`));
-					tui.requestRender();
-					await settle(term);
-				}
-				term.clearWriteLog();
-				transient.replace([]);
-				synthetic.replace([]);
-				tui.setClearOnShrink(clearOnShrink);
-				tui.requestRender();
-				await settle(term);
-				expect(visible(term)).toEqual([
-					"transcript-8 final",
-					"transcript-9",
-					"transcript-10",
-					"transcript-11",
-					"status",
-					"editor",
-				]);
-				const writes = term.getWriteLog().join("");
-				expect(writes).not.toContain("\x1b[2J\x1b[H");
-				expect(writes).not.toContain("\x1b[3J");
-				expect(writes).not.toContain("transcript-0");
-				term.clearWriteLog();
-				tui.requestRender();
-				await settle(term);
-				expect(visible(term)).toEqual([
-					"transcript-8 final",
-					"transcript-9",
-					"transcript-10",
-					"transcript-11",
-					"status",
-					"editor",
-				]);
-			}
+			term.clearWriteLog();
+			transient.replace([]);
+			synthetic.replace([]);
+			tui.requestRender();
+			await settle(term);
+			expect(visible(term)).toEqual([
+				"transcript-8 final",
+				"transcript-9",
+				"transcript-10",
+				"transcript-11",
+				"status",
+				"editor",
+			]);
+			const writes = term.getWriteLog().join("");
+			expect(writes).not.toContain("\x1b[2J\x1b[H");
+			expect(writes).not.toContain("\x1b[3J");
+			expect(writes).not.toContain("transcript-0");
+			term.clearWriteLog();
+			tui.requestRender();
+			await settle(term);
+			expect(visible(term)).toEqual([
+				"transcript-8 final",
+				"transcript-9",
+				"transcript-10",
+				"transcript-11",
+				"status",
+				"editor",
+			]);
 		} finally {
 			tui.stop();
 			for (const key of envKeys) {
@@ -1403,25 +1401,32 @@ describe("registered viewport anchor", () => {
 			for (const key of envKeys) delete Bun.env[key];
 			Bun.env.SSH_CONNECTION = "10.0.0.1 50000 10.0.0.2 22";
 			Bun.env.TERM = "xterm-256color";
-			for (const clearOnShrink of [false, true]) {
-				const term = new VirtualTerminal(30, 6, { isProcessTerminal: true });
-				const tui = new TUI(term);
-				const transcript = new AnchoredTranscript();
-				for (let index = 0; index < 5; index++) {
-					transcript.addRow(`prefix-${index}`, `접두-${index}-가나다라마바사🙂-production-wrap`);
-				}
-				transcript.addRow("target", "\x1b[35m가나다라마바사아자차카타파하🙂끝\x1b[0m");
-				const transient = new Lines(["transient-0"]);
-				const synthetic = new Lines(["synthetic-0"]);
-				const pinned = new Lines(["status", "editor"]);
-				tui.addChild(transcript);
-				tui.addChild(transient);
-				tui.addChild(synthetic);
-				tui.addChild(pinned);
-				tui.setViewportAnchorComponent(transcript);
-				tui.setBottomPinnedComponent(pinned);
-				try {
-					tui.start();
+			const term = new VirtualTerminal(30, 6, { isProcessTerminal: true });
+			const tui = new TUI(term);
+			const transcript = new AnchoredTranscript();
+			for (let index = 0; index < 5; index++) {
+				transcript.addRow(`prefix-${index}`, `접두-${index}-가나다라마바사🙂-production-wrap`);
+			}
+			transcript.addRow("target", "\x1b[35m가나다라마바사아자차카타파하🙂끝\x1b[0m");
+			const transient = new Lines(["transient-0"]);
+			const synthetic = new Lines(["synthetic-0"]);
+			const pinned = new Lines(["status", "editor"]);
+			tui.addChild(transcript);
+			tui.addChild(transient);
+			tui.addChild(synthetic);
+			tui.addChild(pinned);
+			tui.setViewportAnchorComponent(transcript);
+			tui.setBottomPinnedComponent(pinned);
+			try {
+				tui.start();
+				await settle(term);
+				expect(visible(term).some(line => line.includes("끝"))).toBe(true);
+				expect(tui.scrollViewportPages(1)).toBe(true);
+				await term.flush();
+				const targetScreenRow = visible(term).findIndex(line => line.includes("끝"));
+				expect(targetScreenRow).toBeGreaterThanOrEqual(0);
+				for (const width of [14, 70, 10, 30]) {
+					term.resize(width, 6);
 					await settle(term);
 					expect(visible(term).some(line => line.includes("끝"))).toBe(true);
 					expect(tui.revealViewportAnchor("target", "bottom")).toBe(true);
@@ -1432,21 +1437,23 @@ describe("registered viewport anchor", () => {
 						term.resize(width, 6);
 						await settle(term);
 						targetScreenRow = visible(term).findIndex(line => line.includes("끝"));
-						expect(targetScreenRow, `width=${width} clear=${clearOnShrink}`).toBeGreaterThanOrEqual(0);
+						expect(targetScreenRow, `width=${width}`).toBeGreaterThanOrEqual(0);
+						expect(visible(term)[targetScreenRow], `width=${width}`).toContain("끝");
 					}
-					term.clearWriteLog();
-					transient.replace([]);
-					synthetic.replace([]);
-					tui.setClearOnShrink(clearOnShrink);
-					tui.requestRender();
-					await settle(term);
-					expect(visible(term)[targetScreenRow]).toContain("끝");
-					const writes = term.getWriteLog().join("");
-					expect(writes).not.toContain("\x1b[2J\x1b[H");
-					expect(writes).not.toContain("\x1b[3J");
-				} finally {
-					tui.stop();
 				}
+				term.clearWriteLog();
+				transient.replace([]);
+				synthetic.replace([]);
+				tui.requestRender();
+				await settle(term);
+				const finalTargetScreenRow = visible(term).findIndex(line => line.includes("끝"));
+				expect(finalTargetScreenRow).toBeGreaterThanOrEqual(0);
+				expect(visible(term)[finalTargetScreenRow]).toContain("끝");
+				const writes = term.getWriteLog().join("");
+				expect(writes).not.toContain("\x1b[2J\x1b[H");
+				expect(writes).not.toContain("\x1b[3J");
+			} finally {
+				tui.stop();
 			}
 		} finally {
 			for (const [key, value] of previous) {
@@ -1534,6 +1541,87 @@ describe("registered viewport anchor", () => {
 			expect(visible(term).some(line => line === "history-9")).toBe(false);
 		} finally {
 			tui.stop();
+		}
+	});
+
+	it("tracks retained and replacement Kitty placements across unresolved follow-live", async () => {
+		const originalProtocol = TERMINAL.imageProtocol;
+		const originalCellDimensions = getCellDimensions();
+		setCellDimensions({ widthPx: 10, heightPx: 10 });
+		setTerminalImageProtocol(ImageProtocol.Kitty);
+		resetKittyTransmissions();
+		setKittyTransmitWriter(() => {});
+
+		const term = new VirtualTerminal(30, 6);
+		const tui = new TUI(term);
+		const transcript = new AnchoredTranscript();
+		for (let index = 0; index < 10; index++) transcript.addRow(`history-${index}`, `history-${index}`);
+		transcript.addChild(
+			new Image(
+				"AA==",
+				"image/png",
+				{ fallbackColor: value => value },
+				{ maxWidthCells: 4, maxHeightCells: 2 },
+				{ widthPx: 20, heightPx: 20 },
+			),
+		);
+		let firstLiveRow: Text | undefined;
+		for (let index = 10; index < 20; index++) {
+			const row = transcript.addRow(`history-${index}`, `history-${index}`);
+			if (index === 10) firstLiveRow = row;
+		}
+		tui.addChild(transcript);
+		tui.setViewportAnchorComponent(transcript);
+
+		try {
+			tui.start();
+			await settle(term);
+			expect(tui.revealViewportAnchor("history-9", "top")).toBe(true);
+			await settle(term);
+			const [retainedPlacement] = extractKittyPlacementReferences(term.getWriteLog().join(""));
+			expect(retainedPlacement).toBeDefined();
+
+			term.clearWriteLog();
+			transcript.removeFirst(11);
+			transcript.addChild(
+				new Image(
+					"AQ==",
+					"image/png",
+					{ fallbackColor: value => value },
+					{ maxWidthCells: 4, maxHeightCells: 2 },
+					{ widthPx: 20, heightPx: 20 },
+				),
+			);
+			for (let index = 0; index < 4; index++) transcript.addRow(`tail-${index}`, `tail-${index}`);
+			tui.requestRender();
+			await settle(term);
+			const retainedOutput = term.getWriteLog().join("");
+			expect(retainedOutput).toContain(encodeKittyPlacementDelete(retainedPlacement!));
+			expect(extractKittyPlacementReferences(retainedOutput)).toContainEqual(retainedPlacement);
+
+			term.clearWriteLog();
+			expect(tui.followLiveViewport()).toBe(true);
+			await term.flush();
+			const followedOutput = term.getWriteLog().join("");
+			expect(followedOutput).toContain(encodeKittyPlacementDelete(retainedPlacement!));
+			const [replacementPlacement] = extractKittyPlacementReferences(followedOutput);
+			expect(replacementPlacement).toBeDefined();
+			expect(replacementPlacement?.imageId).not.toBe(retainedPlacement?.imageId);
+
+			term.clearWriteLog();
+			firstLiveRow!.setText("history-10 updated");
+			transcript.addRow("tail-4", "tail-4");
+			tui.requestRender();
+			await settle(term);
+			const grownOutput = term.getWriteLog().join("");
+			expect(grownOutput).toContain(encodeKittyPlacementDelete(replacementPlacement!));
+			expect(extractKittyPlacementReferences(grownOutput)).toEqual([]);
+		} finally {
+			tui.stop();
+			setCellDimensions(originalCellDimensions);
+			setTerminalImageProtocol(originalProtocol);
+			resetKittyTransmissions();
+			setKittyTransmitWriter(sequence => process.stdout.write(sequence));
 		}
 	});
 	it("retains unresolved intent through provider removal and resolves a replacement", async () => {
@@ -1688,7 +1776,6 @@ describe("registered viewport anchor", () => {
 			"GJC_TMUX_LAUNCHED",
 			"TERMUX_VERSION",
 			"PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER",
-			"PI_CLEAR_ON_SHRINK",
 			"PI_TUI_VIRTUAL_VIEWPORT",
 		] as const;
 		const previous = new Map<string, string | undefined>(envKeys.map(key => [key, Bun.env[key]]));
@@ -1708,59 +1795,60 @@ describe("registered viewport anchor", () => {
 		] as const;
 		try {
 			for (const testCase of cases) {
-				for (const clearOnShrink of [false, true]) {
-					for (const key of envKeys) delete Bun.env[key];
-					Object.assign(Bun.env, testCase.env);
-					if ("nativeWindows" in testCase) {
-						expect(
-							shouldUseViewportRepaintForHost({}, "win32", { includeNativeWindows: testCase.nativeWindows }),
-						).toBe(true);
-					}
-					const term = new VirtualTerminal(30, 6, { isProcessTerminal: true });
-					const tui = new TUI(term);
-					const transcript = new Lines(Array.from({ length: 12 }, (_value, index) => `transcript-${index}`));
-					const transient = new Lines(Array.from({ length: 6 }, (_value, index) => `transient-${index}`));
-					const synthetic = new Lines(Array.from({ length: 4 }, (_value, index) => `synthetic-${index}`));
-					const pinned = new Lines(["status", "editor"]);
-					tui.addChild(transcript);
-					tui.addChild(transient);
-					tui.addChild(synthetic);
-					tui.addChild(pinned);
-					tui.setViewportAnchorComponent(transcript);
-					tui.setBottomPinnedComponent(pinned);
-					try {
-						tui.start();
+				for (const key of envKeys) delete Bun.env[key];
+				Object.assign(Bun.env, testCase.env);
+				if ("nativeWindows" in testCase) {
+					expect(
+						shouldUseViewportRepaintForHost({}, "win32", { includeNativeWindows: testCase.nativeWindows }),
+					).toBe(true);
+				}
+				const term = new VirtualTerminal(30, 6, { isProcessTerminal: true });
+				const tui = new TUI(term);
+				const transcript = new Lines(Array.from({ length: 12 }, (_value, index) => `transcript-${index}`));
+				const transient = new Lines(Array.from({ length: 6 }, (_value, index) => `transient-${index}`));
+				const synthetic = new Lines(Array.from({ length: 4 }, (_value, index) => `synthetic-${index}`));
+				const pinned = new Lines(["status", "editor"]);
+				tui.addChild(transcript);
+				tui.addChild(transient);
+				tui.addChild(synthetic);
+				tui.addChild(pinned);
+				tui.setViewportAnchorComponent(transcript);
+				tui.setBottomPinnedComponent(pinned);
+				try {
+					tui.start();
+					await settle(term);
+					expect(tui.scrollViewportPages(-1), `${testCase.label} page 1`).toBe(true);
+					await term.flush();
+					expect(tui.scrollViewportPages(-1), `${testCase.label} page 2`).toBe(true);
+					await term.flush();
+					if ("resizeHeight" in testCase) {
+						term.resize(30, testCase.resizeHeight);
 						await settle(term);
-						expect(tui.scrollViewportPages(-1), `${testCase.label} clear=${clearOnShrink} page 1`).toBe(true);
-						await term.flush();
-						expect(tui.scrollViewportPages(-1), `${testCase.label} clear=${clearOnShrink} page 2`).toBe(true);
-						await term.flush();
-						if ("resizeHeight" in testCase) {
-							term.resize(30, testCase.resizeHeight);
-							await settle(term);
-						}
-						term.clearWriteLog();
-						transcript.setLine(8, "transcript-8 final");
-						transient.replace([]);
-						synthetic.replace([]);
-						tui.setClearOnShrink(clearOnShrink);
-						tui.requestRender();
-						await settle(term);
-						const viewport = visible(term);
-						expect(viewport).toContain("transcript-8 final");
-						expect(viewport).toContain("transcript-9");
-						expect(viewport).toContain("transcript-10");
-						expect(viewport).toContain("transcript-11");
-						expect(viewport).toContain("status");
-						expect(viewport).toContain("editor");
-						expect(viewport.indexOf("status")).toBeLessThan(viewport.indexOf("editor"));
-						const writes = term.getWriteLog().join("");
-						expect(writes).not.toContain("\x1b[2J\x1b[H");
-						expect(writes).not.toContain("\x1b[3J");
-						expect(writes).not.toContain("transcript-0");
-					} finally {
-						tui.stop();
 					}
+					term.clearWriteLog();
+					transcript.setLine(8, "transcript-8 final");
+					transient.replace([]);
+					synthetic.replace([]);
+					tui.requestRender();
+					await settle(term);
+					const viewport = visible(term);
+					const transcriptCapacity = Math.max(0, term.rows - 2);
+					const expectedStart = 12 - transcriptCapacity;
+					expect(viewport.slice(0, transcriptCapacity), testCase.label).toEqual(
+						Array.from({ length: transcriptCapacity }, (_value, index) => {
+							const transcriptIndex = expectedStart + index;
+							return transcriptIndex === 8 ? "transcript-8 final" : `transcript-${transcriptIndex}`;
+						}),
+					);
+					expect(viewport).toContain("status");
+					expect(viewport).toContain("editor");
+					expect(viewport.indexOf("status")).toBeLessThan(viewport.indexOf("editor"));
+					const writes = term.getWriteLog().join("");
+					expect(writes).not.toContain("\x1b[2J\x1b[H");
+					expect(writes).not.toContain("\x1b[3J");
+					expect(writes).not.toContain("transcript-0");
+				} finally {
+					tui.stop();
 				}
 			}
 		} finally {
@@ -1793,7 +1881,7 @@ describe("registered viewport anchor", () => {
 			tui.requestRender();
 			await settle(term);
 			const writes = term.getWriteLog().join("");
-			const scrollback = term.getScrollBuffer();
+			const scrollback = term.getScrollBuffer().map(line => line.trim());
 			const oldSentinels = [
 				...Array.from({ length: 10 }, (_value, index) => `frontier-${index}`),
 				"frontier-manual-era",
@@ -1822,5 +1910,29 @@ describe("registered viewport anchor", () => {
 		} finally {
 			tui.stop();
 		}
+	});
+
+	// A terminal that reports `isProcessTerminal: false` has answered the
+	// capability question. Platform identity is only a fallback for hosts that
+	// cannot answer, so win32 must not promote such a terminal onto the
+	// viewport-repaint path — doing so suppresses durable history replay and
+	// leaves contracted rows behind as duplicates.
+	it.each([
+		{ label: "explicit process terminal", isProcessTerminal: true, expected: true },
+		{ label: "explicit non-process terminal", isProcessTerminal: false, expected: false },
+		{ label: "unreported capability", isProcessTerminal: undefined, expected: true },
+	])("resolves the win32 viewport-repaint gate for an $label", ({ isProcessTerminal, expected }) => {
+		expect(shouldUseViewportRepaintForTerminal(isProcessTerminal, {}, "win32")).toBe(expected);
+	});
+
+	it("keeps non-win32 hosts off the viewport-repaint path regardless of capability", () => {
+		for (const isProcessTerminal of [false, undefined] as const) {
+			expect(shouldUseViewportRepaintForTerminal(isProcessTerminal, {}, "linux")).toBe(false);
+		}
+		expect(shouldUseViewportRepaintForTerminal(true, {}, "linux")).toBe(true);
+	});
+
+	it("still honors explicit Windows Terminal markers for a non-process terminal", () => {
+		expect(shouldUseViewportRepaintForTerminal(false, { WT_SESSION: "1" }, "win32")).toBe(true);
 	});
 });

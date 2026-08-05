@@ -2,7 +2,47 @@
 
 ## [Unreleased]
 
-## [0.12.0] - 2026-07-28
+## [0.12.12] - 2026-08-05
+
+## [0.12.11] - 2026-08-03
+
+## [0.12.10] - 2026-08-03
+
+## [0.12.8] - 2026-08-02
+
+### Fixed
+
+- macOS executable discovery now honors explicit `PATH` and `cwd` lookup overrides instead of silently searching the process environment.
+- Postmortem callbacks registered after a completed plain cleanup now run through the handled `Promise.try(...).catch(log)` path instead of a bare synchronous call that dropped the returned promise, so rejecting async late registrations are logged instead of surfacing as unhandled rejections that fail unrelated in-flight work.
+
+## [0.12.7] - 2026-07-31
+
+## [0.12.6] - 2026-07-31
+### Fixed
+
+- Positive-integer environment helpers now reject malformed, fractional, exponent-form, non-positive, and unsafe values instead of silently accepting their numeric prefixes (#3593).
+
+### Fixed
+
+- Glob scans now reject already-aborted and zero-result cancellations instead of returning a misleading successful empty result.
+- Retryable responses discarded before another fetch attempt now begin body cancellation without blocking retry progress on transport cleanup, releasing buffered response data without consuming responses returned to callers.
+
+## [0.12.5] - 2026-07-30
+
+## [0.12.5] - 2026-07-30
+
+## [0.12.4] - 2026-07-30
+
+## [0.12.3] - 2026-07-30
+
+## [0.12.2] - 2026-07-30
+
+## [0.12.1] - 2026-07-29
+
+### Fixed
+
+- The crash-log credential scrubber recognizes GitHub fine-grained PATs (`github_pat_`) and complete AWS STS credentials. It already had rules for both vendors, but matched only the classic `gh[opsur]_` and long-term `AKIA` shapes. It now also covers the temporary `ASIA` key id and, critically, the `SecretAccessKey` / `SessionToken` values that ship alongside it — the id alone is not the credential, and neither canonical field name matched the existing labeled-value rule. All of these previously survived into a file the module keeps indefinitely.
+- `$inheritedEnv` (and therefore `$credentialEnv` / `$pickCredentialEnv`) honours the removal of an inherited variable. The inherited snapshot is taken once, at module load, and was consulted first and unconditionally, so a provider credential exported by the launching shell could never be suppressed afterwards: deleting it from the live environment left every credential lookup still returning the snapshot value. Tests that clear provider env vars before exercising credential resolution therefore ran against the developer's real credential — and printed it when the assertion failed. Deletion is now honoured while the snapshot value stays pinned, so a later in-process write still cannot swap the credential a request authenticates with.
 
 ## [0.11.11] - 2026-07-26
 

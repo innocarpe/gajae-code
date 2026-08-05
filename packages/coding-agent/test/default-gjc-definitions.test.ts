@@ -90,7 +90,7 @@ describe("default GJC definitions", () => {
 			"skill-fragments/deep-interview/auto-research-greenfield.md",
 			"skill-fragments/deep-interview/lateral-review-panel.md",
 			"skill-fragments/ultragoal/ai-slop-cleaner.md",
-			"skill-fragments/ultragoal/pipeline-validation-contracts.md",
+			"skill-fragments/ultragoal/validation-batch-contracts.md",
 		]);
 		const team = workflowDefinitions.find(definition => definition.name === "team");
 		expect(team?.content).toContain("supported surfaces only");
@@ -129,12 +129,12 @@ describe("default GJC definitions", () => {
 		expect(fragments.map(fragment => fragment.kind)).toEqual(["skill-fragment", "skill-fragment"]);
 		expect(fragments.map(fragment => fragment.relativePath).sort()).toEqual([
 			"skill-fragments/ultragoal/ai-slop-cleaner.md",
-			"skill-fragments/ultragoal/pipeline-validation-contracts.md",
+			"skill-fragments/ultragoal/validation-batch-contracts.md",
 		]);
 		const cleaner = fragments.find(fragment => fragment.relativePath.endsWith("ai-slop-cleaner.md"))!;
 		expect(cleaner.content).toContain("AI SLOP CLEANUP REPORT");
 		expect(cleaner.content).toContain("read-only detector");
-		const contracts = fragments.find(fragment => fragment.relativePath.endsWith("pipeline-validation-contracts.md"))!;
+		const contracts = fragments.find(fragment => fragment.relativePath.endsWith("validation-batch-contracts.md"))!;
 		expect(contracts.content).toContain("never user-facing");
 		expect(contracts.content).toContain("fails closed");
 	});
@@ -182,23 +182,31 @@ describe("default GJC definitions", () => {
 		if (!ultragoal) throw new Error("missing bundled ultragoal skill");
 		const content = ultragoal.content;
 
-		const sectionStart = content.indexOf("## Mandatory completion cleanup and review gate");
+		const sectionStart = content.indexOf("## Boundary completion cohort gate");
 		expect(sectionStart).toBeGreaterThanOrEqual(0);
 		const afterStart = content.indexOf("\n## ", sectionStart + 1);
 		const section = content.slice(sectionStart, afterStart === -1 ? undefined : afterStart);
 
-		const cleanerStep = section.indexOf("2. Run the internal ai-slop-cleaner skill fragment");
-		const verifyStep = section.indexOf("3. Rerun verification after the cleaner pass");
+		const verifyStep = section.indexOf("1. Run implementation verification");
+		const freezeStep = section.indexOf("2. **Freeze the change set.**");
+		const cohortStep = section.indexOf("3. **Run the cohort lanes on the frozen snapshot**");
 		const architectStep = section.indexOf("4. Delegate an `architect` review");
 		const redTeamStep = section.indexOf("5. Delegate an `executor` QA/red-team lane");
+		const joinStep = section.indexOf("8. **Join before repairing.**");
 
-		expect(cleanerStep).toBeGreaterThanOrEqual(0);
-		expect(verifyStep).toBeGreaterThan(cleanerStep);
-		expect(architectStep).toBeGreaterThan(verifyStep);
+		// The cleaner is a cohort lane bound to the frozen snapshot, so freezing must
+		// precede it and every lane verdict must join before any repair starts.
+		expect(verifyStep).toBeGreaterThanOrEqual(0);
+		expect(freezeStep).toBeGreaterThan(verifyStep);
+		expect(cohortStep).toBeGreaterThan(freezeStep);
+		expect(architectStep).toBeGreaterThan(cohortStep);
 		expect(redTeamStep).toBeGreaterThan(architectStep);
+		expect(joinStep).toBeGreaterThan(redTeamStep);
 
-		expect(section).toContain("reruns the cleaner until blocking findings are zero");
-		expect(section).toContain("Advisory findings are included in the gate report only");
+		expect(section).toContain("ai-slop-cleaner skill fragment run over the frozen change set");
+		expect(section).toContain("AI SLOP CLEANUP REPORT");
+		expect(section).toContain("join the cohort findings rather than starting their own fix loop");
+		expect(section).toContain("advisory findings are included in the gate report only");
 	});
 
 	it("keeps the four role agents bundled when project .gjc is absent", async () => {
@@ -403,22 +411,37 @@ Project executor override body.
 		expect(ultragoal).toContain("the same final review boundary");
 
 		// B: validation-batch contract summary in the SKILL; full contract in the fragment.
-		expect(ultragoal).toContain("## Validation batches (aggregate-only)");
+		expect(ultragoal).toContain("## Boundary verification (aggregate default)");
+		expect(ultragoal).toContain("### Validation batches (explicit phase/module boundaries)");
+		expect(ultragoal).toContain("## Boundary completion cohort gate");
+		expect(ultragoal).toContain("gjc ultragoal quality-gate validate");
+		expect(ultragoal).toContain(
+			"reports **all** structural, evidence, surface, cohort, and declaration errors in one run",
+		);
+		expect(ultragoal).toContain("strictly read-only");
+		expect(ultragoal).toContain("once per boundary generation");
+		expect(ultragoal).toContain("iteration.reviewCohort");
+		expect(ultragoal).toContain("Join before repairing");
+		expect(ultragoal).toContain("one consolidated blocker batch");
+		expect(ultragoal).toContain("one new generation");
+		expect(ultragoal).toContain("delta-only");
+		expect(ultragoal).toContain("scopeExpansion");
+		expect(ultragoal).toMatch(/advisory.*canonical review is the boundary cohort gate/s);
+		expect(ultragoal).toContain("once per boundary");
+		expect(ultragoal).toContain("deferredToBatch.ranLanes");
 		expect(ultragoal).toContain("--validation-batch-json");
 		expect(ultragoal).toContain("aggregate-only");
 		expect(ultragoal).toContain("fail-closed");
 		expect(ultragoal).toContain("deferredToBatch");
 		expect(ultragoal).toContain("validation-batch-deferred");
 		expect(ultragoal).toContain("validationBatchClose");
-		expect(ultragoal).toContain("mutually exclusive");
-		expect(ultragoal).toContain("no batch/pipeline mixing");
 		expect(ultragoal).toContain("out-of-order close is rejected");
 		expect(ultragoal).toContain("append-only proof");
 		expect(ultragoal).toContain("cumulative-since-base");
-		expect(ultragoal).toContain("skill-fragments/ultragoal/pipeline-validation-contracts.md");
+		expect(ultragoal).toContain("skill-fragments/ultragoal/validation-batch-contracts.md");
 
 		const contracts = getEmbeddedDefaultGjcSkillFragments("ultragoal").find(fragment =>
-			fragment.relativePath.endsWith("pipeline-validation-contracts.md"),
+			fragment.relativePath.endsWith("validation-batch-contracts.md"),
 		)!;
 		expect(contracts.content).toContain("deferredToBatch");
 		expect(contracts.content).toContain("validation-batch-deferred");
@@ -427,6 +450,7 @@ Project executor override body.
 		expect(contracts.content).toContain("append-only proof");
 		expect(contracts.content).toContain("Never stamp");
 		expect(contracts.content).toContain("cumulative-since-base");
+		expect(contracts.content).toContain("Lane declaration is fail-closed");
 		expect(contracts.content).toContain("`cumulativeFromBase: true`");
 		expect(contracts.content).toContain("`memberGoalId` is a label not a per-path attribution");
 		expect(contracts.content).toContain("Batch invalidation is fail-closed");
@@ -438,8 +462,10 @@ Project executor override body.
 
 		// C: intra-goal validation-lane parallelism.
 		expect(ultragoal).toContain("### Intra-goal validation-lane parallelism");
-		expect(ultragoal).toContain("frozen post-cleaner change set");
-		expect(ultragoal).toContain("architect review and the executor QA/red-team lane MAY run in parallel");
+		expect(ultragoal).toContain("Cohort lanes are parallel by construction");
+		expect(ultragoal).toContain(
+			"`cleaner`, `architect`, and `qa` can run concurrently against the identical immutable snapshot",
+		);
 		expect(ultragoal).toContain("join before checkpoint");
 		expect(ultragoal).toContain("Fall back to **sequential** lanes");
 		expect(ultragoal).toContain("red-team lane depends on architect fixes");
@@ -488,21 +514,38 @@ Project executor override body.
 		expect(routing).toContain("`/skill:ultragoal`");
 		expect(routing).toContain("`/skill:team`");
 		expect(routing).toContain("Delegate large implementation slices to `executor`");
+		expect(routing).toContain('explicit user request to use a worktree (for example, "use worktree")');
+		expect(routing).toContain("delegate implementation through `task` with `isolated: true`");
 		expect(routing).toContain("read the full skill text and follow it exactly");
+		expect(routing).toContain("Before explicit execution approval or a valid non-off ralplan final runtime receipt");
 		expect(routing).toContain(
-			"Before explicit execution approval, planning and interview workflows NEVER edit product source",
+			"reconciliation must persist its final receipt before choosing approval or an admitted handoff",
 		);
-		expect(routing.split("\n").filter(line => line.startsWith("-"))).toHaveLength(9);
+		expect(routing.split("\n").filter(line => line.startsWith("-"))).toHaveLength(10);
 		expect(decomposition).toMatch(/skip it for one-step or obvious two-step fixes/i);
 	});
 
-	it("honors explicit ultragoal/team naming as ralplan execution approval", async () => {
+	it("locks ralplan automatic-admission approval and handoff paths", async () => {
 		const ralplan = await Bun.file(
 			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "ralplan", "SKILL.md"),
 		).text();
-		expect(ralplan).toContain("explicit-execution exception");
 		expect(ralplan).toContain("counts as opting into execution for that skill");
-		expect(ralplan).toContain("skip the re-ask and proceed to step 9");
+		expect(ralplan).toContain("gjc.ralplan.autoHandoff");
+		expect(ralplan).toContain("`off` (default), `ultragoal`, or `team`");
+		expect(ralplan).toContain("A `team` target degrades to `off`");
+		expect(ralplan).toContain("`team_unavailable:<reason>`");
+		expect(ralplan).toContain("Invalid settings reject the final write before any final artifact is persisted");
+		expect(ralplan).toContain("ledger-backed runtime-owned `auto_handoff.effectiveTarget`");
+		expect(ralplan).toContain("Reconciliation must first reach the successful final receipt");
+		expect(ralplan).toContain("valid non-off receipt is explicit operator admission");
+		expect(ralplan).toContain("do not choose an approval or handoff path before its final receipt exists");
+		expect(ralplan).toContain("planning_stuck");
+		expect(ralplan).toContain("never dispatch");
+		expect(ralplan).toContain("ordinary `off`/degraded approval flow");
+		expect(ralplan).toContain("do not issue an approval `ask`");
+		expect(ralplan).toContain(
+			"mark ralplan ready for handoff so the skill tool's chain guard permits the transition",
+		);
 	});
 
 	it("documents leader-owned Ultragoal checkpoints for Team bridge workers", async () => {
@@ -579,13 +622,16 @@ Project executor override body.
 		expect(ralplan).toBeDefined();
 		const content = ralplan?.content ?? "";
 
-		expect(content).toContain("gjc ralplan --write --stage <type> --stage_n <N> --artifact");
+		expect(content).toContain(
+			"gjc ralplan --write --session-id <owner-session-id> --run-id <run-id> --stage <type> --stage_n <N> --artifact",
+		);
 		expect(content).toContain("--stage planner");
 		expect(content).toContain("--stage architect");
 		expect(content).toContain("--stage critic");
 		expect(content).toContain("do not directly edit `.gjc/_session-{sessionid}/plans`");
 		expect(content).toContain("gjc state clear --force --mode ralplan");
 		expect(content).toContain('workflowGate: { stage: "ralplan", kind: "approval" }');
+		expect(content).toContain("A role subagent's own session id is transcript/resume identity only");
 		expect(content).toContain("RPC/headless clients receive a `ralplan`/`approval` workflow gate");
 		expect(content).toContain(
 			"Direct `write`, `edit`, or `ast_edit` calls against `.gjc/_session-{sessionid}/specs`, `.gjc/_session-{sessionid}/plans`, `.gjc/_session-{sessionid}/state`, or any other `.gjc/` path are forbidden",

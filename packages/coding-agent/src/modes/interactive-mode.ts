@@ -13,7 +13,7 @@ import {
 	Text,
 	TUI,
 } from "@gajae-code/tui";
-import { APP_NAME, adjustHsv, getProjectDir, logger, postmortem } from "@gajae-code/utils";
+import { APP_NAME, adjustHsv, getProjectDir, logger, postmortem, sanitizeText } from "@gajae-code/utils";
 import chalk from "chalk";
 import { AsyncJobManager } from "../async";
 import {
@@ -61,7 +61,12 @@ import { GajaePetWidget, type PetMode } from "./components/gajae-pet-widget";
 import type { HookEditorComponent } from "./components/hook-editor";
 import type { HookInputComponent } from "./components/hook-input";
 import type { HookSelectorComponent } from "./components/hook-selector";
-import { computeIrcSplitWidths, getIrcSidebarSemanticToken, IrcSplitViewComponent } from "./components/irc-sidebar";
+import {
+	computeIrcSplitWidths,
+	getIrcSidebarSemanticToken,
+	IrcLeftLaneComponent,
+	IrcSplitViewComponent,
+} from "./components/irc-sidebar";
 import {
 	getPetUnavailableWarning,
 	isPetAvailable,
@@ -118,8 +123,9 @@ import { addChatChild, prepareTranscriptRebuild, UiHelpers } from "./utils/ui-he
 function buildComposerPlaceholder(
 	keybindings: Pick<KeybindingsManager, "getDisplayString">,
 	context: KeyDisplayContext,
-	options: { readonly busy: boolean; readonly busyPromptMode: "steer" | "queue" },
+	options: { readonly busy: boolean; readonly busyPromptMode: "steer" | "queue"; readonly showActionHints: boolean },
 ): string {
+	if (!options.showActionHints) return "Type your message...";
 	const parts: string[] = [];
 	const submitKey = options.busy ? keybindings.getDisplayString("tui.input.submit", context) : "";
 	if (submitKey) {
@@ -155,7 +161,11 @@ export function getDefaultComposerPlaceholder(
 		KeybindingsManager.inMemory({
 			"app.message.queue": defaultMessageQueueKeysForPlatform(context.platform),
 		});
-	return buildComposerPlaceholder(effectiveKeybindings, context, { busy: false, busyPromptMode: "steer" });
+	return buildComposerPlaceholder(effectiveKeybindings, context, {
+		busy: false,
+		busyPromptMode: "steer",
+		showActionHints: true,
+	});
 }
 
 export const DEFAULT_COMPOSER_PLACEHOLDER = getDefaultComposerPlaceholder();
@@ -163,9 +173,23 @@ export const DEFAULT_COMPOSER_PLACEHOLDER = getDefaultComposerPlaceholder();
 export function getComposerPlaceholder(
 	keybindings: Pick<KeybindingsManager, "getDisplayString">,
 	context: KeyDisplayContext,
-	options: { readonly busy: boolean; readonly busyPromptMode: "steer" | "queue" },
+	options: { readonly busy: boolean; readonly busyPromptMode: "steer" | "queue"; readonly showActionHints: boolean },
 ): string {
 	return buildComposerPlaceholder(keybindings, context, options);
+}
+
+export function resolveActivityIndicatorMessage(
+	foregroundActive: boolean,
+	activeBackgroundTasks: number,
+	foregroundMessage: string,
+): string | undefined {
+	const backgroundCount = Math.max(0, Math.trunc(activeBackgroundTasks));
+	if (foregroundActive) {
+		if (backgroundCount === 0) return foregroundMessage;
+		return `${foregroundMessage} · ${backgroundCount} background task${backgroundCount === 1 ? "" : "s"}`;
+	}
+	if (backgroundCount === 0) return undefined;
+	return `Background: ${backgroundCount} task${backgroundCount === 1 ? "" : "s"}…`;
 }
 const WELCOME_RESERVED_CONTAINER_CHILD_LIMIT = 8;
 const COMPOSER_RIGHT_GUTTER_WIDTH = 1;
@@ -432,6 +456,12 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	#jobsObserver?: JobsObserver;
 	#tasksAggregator?: TasksAggregator;
+	#foregroundActivity = false;
+	#activityIndicatorSuspensions = 0;
+	#suspendedActivityIndicator?: Loader;
+	#stopped = false;
+	#initPromise?: Promise<void>;
+	#stopListeners = new Set<() => void>();
 	#eventBus?: EventBus;
 	#eventBusUnsubscribers: Array<() => void> = [];
 	#welcomeComponent?: WelcomeComponent;
@@ -646,7 +676,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#todoCommandController = new TodoCommandController(this);
 		this.#selectorController = new SelectorController(this);
 		this.#inputController = new InputController(this);
-		this.statusLine.setActionRegistry(this.#inputController.actionRegistry, () => this.keybindings);
+		// Composer shortcut discovery owns contextual action hints; retain only status telemetry in the rail.
 		this.promptSuggestion = new PromptSuggestionController(this);
 		this.#observerRegistry = new SessionObserverRegistry();
 	}
@@ -664,8 +694,16 @@ export class InteractiveMode implements InteractiveModeContext {
 		);
 	}
 
-	async init(): Promise<void> {
-		if (this.isInitialized) return;
+	init(): Promise<void> {
+		if (this.#stopped || this.isInitialized) return Promise.resolve();
+		this.#initPromise ??= this.#initialize().finally(() => {
+			this.#initPromise = undefined;
+		});
+		return this.#initPromise;
+	}
+
+	async #initialize(): Promise<void> {
+		if (this.#stopped || this.isInitialized) return;
 
 		this.keybindings = logger.time("InteractiveMode.init:keybindings", () => KeybindingsManager.create());
 		this.keybindings.setDisplayContext(this.#keyDisplayContext);
@@ -686,6 +724,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.refreshSlashCommandState.bind(this),
 			getProjectDir(),
 		);
+		if (this.#stopped) return;
 
 		// Get current model info for welcome screen
 		const modelName = this.session.model?.name ?? "Unknown";
@@ -814,10 +853,15 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.#observerRegistry,
 				this.session.getAgentId(),
 			);
+			this.#tasksAggregator.onChange(() => {
+				this.syncActivityIndicator();
+				this.ui.requestRender();
+			});
 		}
 
 		// Load initial todos
 		await this.#loadTodoList();
+		if (this.#stopped) return;
 
 		// Start the UI
 		this.ui.start();
@@ -826,6 +870,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.updateEditorChrome();
 		this.#syncEditorMaxHeight();
 		this.isInitialized = true;
+		this.syncActivityIndicator();
 		if (this.settings.get("tasksPane.defaultVisible")) this.showTasksPane();
 		this.#syncIrcSidebarAvailabilityFromSettings();
 		this.ui.requestRender(true);
@@ -837,6 +882,7 @@ export class InteractiveMode implements InteractiveModeContext {
 						getRecentSessions(this.sessionManager.getSessionDir()),
 					)
 					.then(sessions => {
+						if (this.#stopped) return;
 						if (this.#welcomeComponent !== welcomeComponent) return;
 						welcomeComponent.setRecentSessions(
 							sessions.map(session => ({
@@ -871,22 +917,26 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		if (starReminderGate.schedule) {
 			scheduleLaunchStarReminderAfterFirstRender({
-				confirm: (title, message) => this.showHookConfirm(title, message),
+				confirm: (title, message) =>
+					this.#stopped ? Promise.resolve(false) : this.showHookConfirm(title, message),
 				isIdle: () => !this.session.isStreaming && !this.isBackgrounded && !this.hookSelector,
 			});
 		}
 
 		// Initialize hooks with TUI-based UI context
 		await this.initHooksAndCustomTools();
+		if (this.#stopped) return;
 
 		// Restore mode from session (e.g. plan mode on resume)
 		await this.#restoreModeFromSession();
+		if (this.#stopped) return;
 
 		// Restore unsent editor draft from previous session shutdown (Ctrl+D).
 		// One-shot: consumeDraft removes the sidecar after read so the next
 		// resume does not re-restore the same text.
 		try {
 			const draft = await this.sessionManager.consumeDraft();
+			if (this.#stopped) return;
 			if (draft && !this.editor.getText()) {
 				this.editor.setText(draft);
 				this.updateEditorChrome();
@@ -895,6 +945,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		} catch (err) {
 			logger.warn("Failed to restore session draft", { error: String(err) });
 		}
+		if (this.#stopped) return;
 
 		// Subscribe to agent events
 		this.#subscribeToAgent();
@@ -906,6 +957,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		);
 		// Set up theme file watcher
 		onThemeChange(() => {
+			if (this.#stopped) return;
 			clearRenderCache();
 			this.#ircSplitView.invalidateTheme();
 			configureDefaultComposerChrome(this.editor);
@@ -938,8 +990,10 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	/** Reload slash commands and autocomplete for the provided working directory. */
 	async refreshSlashCommandState(cwd?: string): Promise<void> {
+		if (this.#stopped) return;
 		const basePath = cwd ?? this.sessionManager.getCwd();
 		const fileCommands = await loadSlashCommands({ cwd: basePath });
+		if (this.#stopped) return;
 		const fileCommandNames = new Set(fileCommands.map(cmd => cmd.name));
 		this.fileSlashCommands = fileCommandNames;
 		const fileSlashCommands: SlashCommand[] = fileCommands.map(cmd => ({
@@ -982,9 +1036,15 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.session.getGoalModeState()?.mode === "exiting") {
 			await this.#goalModeController.beforeGetUserInput();
 		}
-		const { promise, resolve } = Promise.withResolvers<SubmittedUserInput>();
+		const { promise, resolve, reject } = Promise.withResolvers<SubmittedUserInput>();
+		let unsubscribeStop = () => {};
+		unsubscribeStop = this.onStop(() => {
+			this.onInputCallback = undefined;
+			reject(Object.assign(new Error("Interactive mode stopped"), { code: "cancelled" }));
+		});
 		this.onInputCallback = input => {
 			this.onInputCallback = undefined;
+			unsubscribeStop();
 			resolve(input);
 		};
 		this.#goalModeController.scheduleContinuation();
@@ -1069,11 +1129,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#pendingSubmissionDispose = undefined;
 		this.#pendingWorkingMessage = undefined;
 		this.#goalModeController.onPendingSubmissionFinished(submission.customType);
-		if (this.loadingAnimation) {
-			this.loadingAnimation.stop();
-			this.loadingAnimation = undefined;
-			this.statusContainer.clear();
-		}
+		this.stopLoadingAnimation();
 		if (!submission.customType) {
 			this.pendingImages = submission.images ? [...submission.images] : [];
 			this.rebuildChatFromMessages("reconcile-same-transcript");
@@ -1105,11 +1161,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.optimisticUserMessageSignature = undefined;
 			pendingSubmissionDispose?.();
 			this.#pendingWorkingMessage = undefined;
-			if (this.loadingAnimation) {
-				this.loadingAnimation.stop();
-				this.loadingAnimation = undefined;
-				this.statusContainer.clear();
-			}
+			this.stopLoadingAnimation();
 		}
 	}
 
@@ -1132,6 +1184,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		return getComposerPlaceholder(this.keybindings, this.#keyDisplayContext, {
 			busy: this.#isPromptDeliveryBusy(),
 			busyPromptMode: this.settings.get("busyPromptMode"),
+			showActionHints: this.settings.get("statusLine.showActionHints"),
 		});
 	}
 
@@ -1280,18 +1333,23 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.renderSessionContext(context);
 	}
 
+	#sanitizeTodoText(text: string): string {
+		return sanitizeText(text).replaceAll("\t", "    ");
+	}
+
 	#formatTodoLine(todo: TodoItem, prefix: string): string {
 		const checkbox = theme.checkbox;
 		const marker = formatHudNoteMarker(todo.notes?.length ?? 0);
+		const content = this.#sanitizeTodoText(todo.content);
 		switch (todo.status) {
 			case "completed":
-				return theme.fg("success", `${prefix}${checkbox.checked} ${chalk.strikethrough(todo.content)}`) + marker;
+				return theme.fg("success", `${prefix}${checkbox.checked} ${chalk.strikethrough(content)}`) + marker;
 			case "in_progress":
-				return theme.fg("accent", `${prefix}${checkbox.unchecked} ${todo.content}`) + marker;
+				return theme.fg("accent", `${prefix}${checkbox.unchecked} ${content}`) + marker;
 			case "abandoned":
-				return theme.fg("error", `${prefix}${checkbox.unchecked} ${chalk.strikethrough(todo.content)}`) + marker;
+				return theme.fg("error", `${prefix}${checkbox.unchecked} ${chalk.strikethrough(content)}`) + marker;
 			default:
-				return theme.fg("dim", `${prefix}${checkbox.unchecked} ${todo.content}`) + marker;
+				return theme.fg("dim", `${prefix}${checkbox.unchecked} ${content}`) + marker;
 		}
 	}
 
@@ -1301,6 +1359,13 @@ export class InteractiveMode implements InteractiveModeContext {
 			phase.tasks.some(task => task.status === "pending" || task.status === "in_progress"),
 		);
 		return active ?? nonEmpty[nonEmpty.length - 1];
+	}
+
+	#addTodoContent(lines: string[]): void {
+		const content = new Text(lines.join("\n"), 1, 0);
+		this.todoContainer.addChild(
+			new IrcLeftLaneComponent(content, width => this.#ircSplitView.effectiveSidebarVisible(width)),
+		);
 	}
 
 	#renderTodoList(): void {
@@ -1319,7 +1384,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			const activePhase = phases[activeIdx];
 			if (!activePhase) return;
 			lines.push(
-				`${indent}${theme.fg("accent", `${hook} ${formatPhaseDisplayName(activePhase.name, activeIdx + 1)}`)}`,
+				`${indent}${theme.fg("accent", `${hook} ${formatPhaseDisplayName(this.#sanitizeTodoText(activePhase.name), activeIdx + 1)}`)}`,
 			);
 			const visibleTasks = activePhase.tasks.slice(0, 5);
 			visibleTasks.forEach((todo, index) => {
@@ -1330,19 +1395,21 @@ export class InteractiveMode implements InteractiveModeContext {
 				const remaining = activePhase.tasks.length - visibleTasks.length;
 				lines.push(theme.fg("muted", `${indent}  ${hook} +${remaining} more`));
 			}
-			this.todoContainer.addChild(new Text(lines.join("\n"), 1, 0));
+			this.#addTodoContent(lines);
 			return;
 		}
 
 		phases.forEach((phase, phaseIndex) => {
-			lines.push(`${indent}${theme.fg("accent", `${hook} ${formatPhaseDisplayName(phase.name, phaseIndex + 1)}`)}`);
+			lines.push(
+				`${indent}${theme.fg("accent", `${hook} ${formatPhaseDisplayName(this.#sanitizeTodoText(phase.name), phaseIndex + 1)}`)}`,
+			);
 			phase.tasks.forEach((todo, index) => {
 				const prefix = `${indent}${index === 0 ? hook : " "} `;
 				lines.push(this.#formatTodoLine(todo, prefix));
 			});
 		});
 
-		this.todoContainer.addChild(new Text(lines.join("\n"), 1, 0));
+		this.#addTodoContent(lines);
 	}
 
 	async #loadTodoList(): Promise<void> {
@@ -1377,17 +1444,38 @@ export class InteractiveMode implements InteractiveModeContext {
 		await this.#planModeController.restoreFromSession(sessionContext);
 	}
 
+	isStopped(): boolean {
+		return this.#stopped;
+	}
+
+	onStop(callback: () => void): () => void {
+		if (this.#stopped) {
+			callback();
+			return () => {};
+		}
+		this.#stopListeners.add(callback);
+		return () => this.#stopListeners.delete(callback);
+	}
+
 	stop(): void {
+		const wasInitialized = this.isInitialized;
+		this.#stopped = true;
+		for (const listener of this.#stopListeners) {
+			try {
+				listener();
+			} catch (error) {
+				logger.warn("Interactive stop listener failed", { error: String(error) });
+			}
+		}
+		this.#stopListeners.clear();
+		this.#stopLoadingAnimation();
+		this.#suspendedActivityIndicator = undefined;
 		this.#petProtocolUnsubscribe?.();
 		this.#petProtocolUnsubscribe = undefined;
 		this.#petUnavailableWarningDisposer?.();
 		this.#petUnavailableWarningDisposer = undefined;
 		this.petWidget?.dispose();
 		this.petWidget = undefined;
-		if (this.loadingAnimation) {
-			this.loadingAnimation.stop();
-			this.loadingAnimation = undefined;
-		}
 		this.#welcomeComponent?.dispose();
 		this.#welcomeComponent = undefined;
 		if (this.#sttController) {
@@ -1395,8 +1483,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#sttController = undefined;
 		}
 		this.#goalModeController.cancelContinuation();
-		this.#extensionUiController.clearExtensionTerminalInputListeners();
-		this.#extensionUiController.clearHookWidgets();
+		this.#extensionUiController.dispose();
 		for (const unsubscribe of this.#eventBusUnsubscribers) {
 			unsubscribe();
 		}
@@ -1420,10 +1507,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.#subprocessTeardownUnsubscribe) {
 			this.#subprocessTeardownUnsubscribe();
 		}
-		if (this.isInitialized) {
-			this.ui.stop();
-			this.isInitialized = false;
-		}
+		if (wasInitialized) this.ui.stop();
+		this.isInitialized = false;
 	}
 
 	async shutdown(): Promise<void> {
@@ -1539,6 +1624,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		};
 
 		void this.refreshSlashCommandState().catch(error => {
+			if (this.#stopped) return;
 			logger.warn("Failed to refresh slash command state for custom editor", { error: String(error) });
 		});
 
@@ -1562,11 +1648,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#pendingSubmissionDispose?.();
 		this.#pendingSubmissionDispose = undefined;
 		this.#pendingWorkingMessage = undefined;
-		if (this.loadingAnimation) {
-			this.loadingAnimation.stop();
-			this.loadingAnimation = undefined;
-			this.statusContainer.clear();
-		}
+		this.stopLoadingAnimation();
 		this.#uiHelpers.showError(message);
 	}
 
@@ -1612,7 +1694,33 @@ export class InteractiveMode implements InteractiveModeContext {
 		return main && dim ? { main, dim } : undefined;
 	}
 
-	ensureLoadingAnimation(): void {
+	#activeBackgroundTaskCount(): number {
+		return this.session.getAsyncJobSnapshot()?.running.length ?? 0;
+	}
+
+	#stopLoadingAnimation(): void {
+		this.loadingAnimation?.stop();
+		this.loadingAnimation = undefined;
+		this.statusContainer.clear();
+	}
+
+	syncActivityIndicator(): void {
+		if (this.#stopped || this.#activityIndicatorSuspensions > 0 || this.autoCompactionLoader || this.retryLoader)
+			return;
+		const foregroundActive = this.#foregroundActivity || this.session.isStreaming;
+		if (!this.isInitialized && !foregroundActive) {
+			this.#stopLoadingAnimation();
+			return;
+		}
+		const message = resolveActivityIndicatorMessage(
+			this.#foregroundActivity || this.session.isStreaming,
+			this.#activeBackgroundTaskCount(),
+			this.#pendingWorkingMessage ?? this.#defaultWorkingMessage,
+		);
+		if (!message) {
+			this.#stopLoadingAnimation();
+			return;
+		}
 		if (!this.loadingAnimation) {
 			this.statusContainer.clear();
 			this.loadingAnimation = new Loader(
@@ -1621,42 +1729,66 @@ export class InteractiveMode implements InteractiveModeContext {
 					const accent = this.#getWorkingMessageAccent();
 					return accent ? `${accent.main}${spinner}\x1b[39m` : theme.fg("accent", spinner);
 				},
-				message => renderWorkingMessage(message, this.#getWorkingMessageAccent()),
-				this.#defaultWorkingMessage,
+				workingMessage => renderWorkingMessage(workingMessage, this.#getWorkingMessageAccent()),
+				message,
 				getSymbolTheme().spinnerFrames,
 				{ timeDependentColor: true },
 			);
 			this.statusContainer.addChild(this.loadingAnimation);
 		}
+		this.loadingAnimation.setMessage(message);
+	}
 
-		this.applyPendingWorkingMessage();
+	ensureLoadingAnimation(): void {
+		this.#foregroundActivity = true;
+		this.syncActivityIndicator();
+	}
+
+	stopLoadingAnimation(options?: { restoreBackground?: boolean }): void {
+		this.#foregroundActivity = false;
+		if (options?.restoreBackground === false) {
+			this.#stopLoadingAnimation();
+			return;
+		}
+		this.syncActivityIndicator();
+	}
+
+	suspendActivityIndicator(): () => void {
+		const isFirstSuspension = this.#activityIndicatorSuspensions++ === 0;
+		if (isFirstSuspension && !this.autoCompactionLoader && !this.retryLoader) {
+			const loadingAnimation = this.loadingAnimation;
+			if (loadingAnimation && this.statusContainer.children.includes(loadingAnimation)) {
+				this.statusContainer.detachChild(loadingAnimation);
+				this.#suspendedActivityIndicator = loadingAnimation;
+			}
+		}
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			this.#activityIndicatorSuspensions = Math.max(0, this.#activityIndicatorSuspensions - 1);
+			if (this.#activityIndicatorSuspensions > 0) return;
+			const suspended = this.#suspendedActivityIndicator;
+			this.#suspendedActivityIndicator = undefined;
+			if (
+				!this.#stopped &&
+				suspended &&
+				this.loadingAnimation === suspended &&
+				!this.statusContainer.children.includes(suspended)
+			) {
+				this.statusContainer.addChild(suspended);
+			}
+			this.syncActivityIndicator();
+		};
 	}
 
 	setWorkingMessage(message?: string): void {
-		if (message === undefined) {
-			this.#pendingWorkingMessage = undefined;
-			if (this.loadingAnimation) {
-				this.loadingAnimation.setMessage(this.#defaultWorkingMessage);
-			}
-			return;
-		}
-
-		if (this.loadingAnimation) {
-			this.loadingAnimation.setMessage(message);
-			return;
-		}
-
 		this.#pendingWorkingMessage = message;
+		if (this.#foregroundActivity) this.syncActivityIndicator();
 	}
 
 	applyPendingWorkingMessage(): void {
-		if (this.#pendingWorkingMessage === undefined) {
-			return;
-		}
-
-		const message = this.#pendingWorkingMessage;
-		this.#pendingWorkingMessage = undefined;
-		this.setWorkingMessage(message);
+		this.syncActivityIndicator();
 	}
 
 	showNewVersionNotification(newVersion: string): void {
@@ -2275,6 +2407,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	async reloadTodos(): Promise<void> {
 		await this.#loadTodoList();
+		if (this.#stopped) return;
 		this.ui.requestRender();
 	}
 

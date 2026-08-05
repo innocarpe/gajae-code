@@ -35,6 +35,10 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"slash_command:transcript": "visual/local-only transcript viewer, not a user-facing SDK control seam",
 	"slash_command:sessions": "visual/local-only sessions dashboard, not a user-facing SDK control seam",
 	"agent_session:constructor": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:registerToolSessionCleanup":
+		"internal tool lifecycle cleanup registration, not a user-facing SDK control seam",
+	"agent_session:registerToolSessionTransitionCleanup":
+		"internal tool transition cleanup registration for shared artifact-manager ownership, not a user-facing SDK control seam",
 	"agent_session:nextToolChoice": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setForcedToolChoice": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getActiveSkillState": "internal accessor/plumbing, not a user-facing control seam",
@@ -64,6 +68,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:closeWriterStrict": "internal ACP lifecycle teardown plumbing, not a user-facing control seam",
 	"agent_session:disposeChildSubprocesses": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:waitForIdle": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:extendStartupTurnBarrier":
+		"internal CLI startup-readiness fence composition, not a user-facing SDK control seam",
 	"agent_session:awaitPendingContextTransformations":
 		"internal context-transformation lifecycle barrier, not a user-facing SDK control seam",
 	"agent_session:drainAsyncJobDeliveriesForAcp": "internal accessor/plumbing, not a user-facing control seam",
@@ -125,6 +131,7 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:getActiveModelProfile": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getSessionDefaultModelSelector": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:recordResumeDefaultModel": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:resolveConfiguredDefaultModel": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setModelTemporary": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setModelTemporaryForControl":
 		"internal Telegram control wrapper over the reviewed model.set seam, not an independent public SDK operation",
@@ -150,6 +157,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:runIdleCompaction": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:abortBranchSummary": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:abortHandoff": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:abortPromptAndWait":
+		"internal SDK prompt-terminalization resource fence over a host-captured run handle, not an independent public SDK control seam",
 	"agent_session:prepareContributionPrep": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setResourceSampler": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setRetainedMemorySampler": "internal accessor/plumbing, not a user-facing control seam",

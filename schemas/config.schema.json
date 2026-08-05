@@ -36,6 +36,29 @@
 						"disabled"
 					],
 					"default": "copy-retain"
+				},
+				"resumeModelBehavior": {
+					"type": "string",
+					"enum": [
+						"keepSessionModel",
+						"useCurrentDefault",
+						"ask"
+					],
+					"description": "When resuming a session: keep the model that session last used, switch to the currently configured default model, or ask (TUI only; falls back to keeping the session's model in headless/CLI resume).",
+					"default": "keepSessionModel"
+				}
+			},
+			"additionalProperties": false
+		},
+		"sdk": {
+			"type": "object",
+			"properties": {
+				"promptDeadlineMs": {
+					"type": "integer",
+					"description": "SDK-owned prompt deadline; ACP has no separate timeout.",
+					"default": 1800000,
+					"minimum": 60000,
+					"maximum": 86400000
 				}
 			},
 			"additionalProperties": false
@@ -50,6 +73,9 @@
 				"telegram": {
 					"type": "object",
 					"properties": {
+						"enabled": {
+							"type": "boolean"
+						},
 						"botToken": {
 							"type": "string"
 						},
@@ -80,6 +106,16 @@
 								}
 							},
 							"additionalProperties": false
+						},
+						"sound": {
+							"type": "string",
+							"enum": [
+								"all",
+								"important",
+								"none"
+							],
+							"description": "Choose which Telegram notifications play a sound.",
+							"default": "all"
 						},
 						"rich": {
 							"type": "object",
@@ -129,6 +165,9 @@
 				"discord": {
 					"type": "object",
 					"properties": {
+						"enabled": {
+							"type": "boolean"
+						},
 						"botToken": {
 							"type": "string"
 						},
@@ -147,6 +186,9 @@
 				"slack": {
 					"type": "object",
 					"properties": {
+						"enabled": {
+							"type": "boolean"
+						},
 						"botToken": {
 							"type": "string"
 						},
@@ -351,6 +393,15 @@
 				"ralplan": {
 					"type": "object",
 					"properties": {
+						"autoHandoff": {
+							"type": "string",
+							"enum": [
+								"off",
+								"ultragoal",
+								"team"
+							],
+							"default": "off"
+						},
 						"maxIterations": {
 							"type": "number",
 							"default": 5
@@ -448,7 +499,7 @@
 				},
 				"showActionHints": {
 					"type": "boolean",
-					"description": "Show contextual keyboard shortcuts in the status line",
+					"description": "Show contextual keyboard shortcuts in the composer placeholder",
 					"default": true
 				},
 				"leftSegments": {
@@ -904,6 +955,11 @@
 					"type": "number",
 					"description": "Maximum provider stream replay retries for replay-safe transient stream failures. Counts retries, not the first attempt. Set to 0 to disable provider stream retries.",
 					"default": 5
+				},
+				"streamFirstEventTimeoutMs": {
+					"type": "number",
+					"description": "Maximum wait for the first provider stream event, in ms. Set to 0 to disable the watchdog.",
+					"default": 100000
 				},
 				"fallbackChains": {
 					"type": "object",

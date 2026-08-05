@@ -40,7 +40,7 @@ import {
 import type { InteractiveModeContext } from "../src/modes/types";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { SessionIndex } from "../src/sdk/broker/session-index";
-import { createNotificationsExtension, PresentationArbiter } from "../src/sdk/bus";
+import { createNotificationsExtension, formatPromptSettlementDiagnostic, PresentationArbiter } from "../src/sdk/bus";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import { getNotificationConfig } from "../src/sdk/bus/config";
 import { NotificationSessionController } from "../src/sdk/bus/session-control";
@@ -61,7 +61,7 @@ import type {
 	ClientBridgePermissionToolCall,
 } from "../src/session/client-bridge";
 import { SessionManager } from "../src/session/session-manager";
-import { getAskAnswerSource } from "../src/tools/ask-answer-registry";
+import { getAskAnswerSource, registerAskAnswerSource } from "../src/tools/ask-answer-registry";
 import { startProductionSdkHost } from "./helpers/sdk-production-host";
 
 type SdkPermissionProvider =
@@ -128,8 +128,9 @@ function start(
 		cwd: string;
 		sessionId: string;
 		onRegistered?: (registration: telegramDaemon.RegisterNotificationRootResult) => void;
-	}) => Promise<"attached">,
+	}) => Promise<"attached" | "blocked">,
 	controller?: NotificationSessionController,
+	ensureProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<unknown>,
 ): Map<string, (event: unknown, context: unknown) => unknown> {
 	const handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
 	const api = {
@@ -162,7 +163,9 @@ function start(
 		(lifecycle ? ({ get: () => undefined, getAgentDir: () => ctx.cwd } as unknown as Settings) : undefined);
 	createNotificationsExtension(
 		api,
-		effectiveSettings ? { settings: effectiveSettings, ensureTelegramDaemon, controller } : undefined,
+		effectiveSettings
+			? { settings: effectiveSettings, ensureTelegramDaemon, ensureProviderDaemon, controller }
+			: undefined,
 	);
 	if (autoStart) void handlers.get("session_start")?.({ type: "session_start" }, ctx);
 	return handlers;
@@ -205,6 +208,7 @@ function context(
 		getContextUsage: () => ({ tokens: 3, contextWindow: 100, percent: 3 }),
 		model: { provider: "fixture-provider", id: "reasoning-model" },
 		getThinkingLevel: () => "low",
+		getActivePromptHandle: () => undefined,
 		modelRegistry: {
 			getAll: () => [
 				{
@@ -231,6 +235,7 @@ function context(
 					},
 				},
 			],
+			getActiveProviders: () => [{ provider: "fixture-provider", connectionKind: "credential" }],
 		},
 		getSystemPrompt: () => ["test"],
 		isIdle: () => live.idle ?? true,
@@ -277,6 +282,37 @@ function context(
 	};
 }
 
+test("prompt settlement diagnostics are bounded and redact raw resource labels", () => {
+	const now = 100_000_000;
+	const labels = Array.from({ length: 10 }, (_, index) => `secret-provider-tool-label-${index}`);
+	const diagnostic = formatPromptSettlementDiagnostic(
+		{
+			status: "unfenced",
+			reason: "resources_pending",
+			pending: labels.map((label, index) => ({
+				id: String(index),
+				kind: index % 2 === 0 ? "provider_iterator" : "tool",
+				label,
+				registeredAt: index === 0 ? now + 1_000 : index === 1 ? now - 100_000_000 : now - index,
+			})),
+		},
+		now,
+	);
+	const parsed = JSON.parse(diagnostic) as {
+		reason: string;
+		pending: Array<{ kind: string; labelHash: string; ageMs: number }>;
+		omitted: number;
+	};
+
+	expect(parsed.reason).toBe("resources_pending");
+	expect(parsed.pending).toHaveLength(8);
+	expect(parsed.omitted).toBe(2);
+	expect(parsed.pending[0]?.ageMs).toBe(0);
+	expect(parsed.pending[1]?.ageMs).toBe(86_400_000);
+	expect(parsed.pending.every(entry => /^[0-9a-f]{16}$/.test(entry.labelHash))).toBe(true);
+	expect(labels.every(label => !diagnostic.includes(label))).toBe(true);
+	expect(new TextEncoder().encode(diagnostic).byteLength).toBeLessThanOrEqual(2_048);
+});
 test("shared ask-gate schema and stage-state authority preserves generic producer inputs", () => {
 	const labels = Array.from({ length: 33 }, (_, index) => (index === 32 ? "option-0" : `option-${index}`));
 	const question = { id: "generic-ask", multi: true, allowEmpty: false };
@@ -546,6 +582,87 @@ test("Telegram root release failure is retained and retried through lifecycle sh
 	}
 }, 60_000);
 
+test("Telegram cleanup is never retained without a registration token", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-telegram-root-tokenless-"));
+	dirs.push(cwd);
+	const sessionId = `telegram-root-tokenless-${Date.now()}`;
+	const settings = telegramSettings(path.join(cwd, "agent"), true);
+	const capability = new SdkStartupCapability(new SdkStartupRollbackTracker());
+	const unregister = spyOn(telegramDaemon, "unregisterNotificationRoot");
+	try {
+		const sessionContext = context(cwd, sessionId);
+		const handlers = start(
+			sessionContext,
+			settings,
+			() => {},
+			false,
+			new Map(),
+			{ startupCapability: capability, lifecycleRequired: true },
+			false,
+			async () => "attached",
+		);
+		await handlers.get("session_start")!({ type: "session_start" }, sessionContext);
+		await expect(capability.promise).resolves.toEqual({ status: "started" });
+		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
+		expect(unregister).not.toHaveBeenCalled();
+	} finally {
+		unregister.mockRestore();
+	}
+}, 60_000);
+
+test("Telegram ownership races publish safe siblings only in broker-authorized chat scope", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-telegram-sibling-isolation-"));
+	dirs.push(cwd);
+	const agentDir = path.join(cwd, "agent");
+	const sessionId = `telegram-sibling-isolation-${Date.now()}`;
+	const base = Settings.isolated({
+		"notifications.enabled": true,
+		"notifications.telegram.botToken": "123456:token",
+		"notifications.telegram.chatId": "42",
+		"notifications.discord.enabled": true,
+		"notifications.discord.botToken": "discord-token",
+		"notifications.discord.applicationId": "discord-app",
+		"notifications.discord.guildId": "discord-guild",
+		"notifications.discord.parentChannelId": "discord-parent",
+	});
+	const settings = new Proxy(base, {
+		get(target, prop) {
+			if (prop === "getAgentDir") return () => agentDir;
+			const value = Reflect.get(target, prop, target);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	}) as Settings;
+	const capability = new SdkStartupCapability(new SdkStartupRollbackTracker());
+	const sessionContext = context(cwd, sessionId);
+	const handlers = start(
+		sessionContext,
+		settings,
+		() => {},
+		false,
+		new Map(),
+		{ startupCapability: capability, lifecycleRequired: true },
+		false,
+		async () => "blocked",
+		undefined,
+		async () => "attached",
+	);
+	await handlers.get("session_start")!({ type: "session_start" }, sessionContext);
+	await expect(capability.promise).resolves.toEqual({ status: "started" });
+	const defaultEndpoint = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	const chatStateRoot = path.join(cwd, ".gjc", "state", "chat");
+	const chatEndpoint = path.join(chatStateRoot, "sdk", `${sessionId}.json`);
+	expect(fs.existsSync(defaultEndpoint)).toBe(false);
+	expect(fs.existsSync(chatEndpoint)).toBe(true);
+	const sessions = (await new SessionIndex(agentDir).open()).listSessions().sessions;
+	expect(sessions).toContainEqual(
+		expect.objectContaining({
+			sessionId,
+			locator: { repo: path.resolve(cwd), stateRoot: chatStateRoot },
+			endpointMtimeMs: fs.statSync(chatEndpoint).mtimeMs,
+		}),
+	);
+	await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
+}, 60_000);
 test("Telegram root ownership is recorded when reconciliation configures Telegram after startup", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-telegram-root-reconcile-"));
 	dirs.push(cwd);
@@ -1863,7 +1980,14 @@ test("SDK host replays an accepted prompt terminal after its requester disconnec
 	);
 	expect(lifecycle).toEqual([
 		expect.objectContaining({ payload: { type: "agent_start", sessionId, ...correlation } }),
-		expect.objectContaining({ payload: { type: "agent_end", sessionId, ...correlation } }),
+		expect.objectContaining({
+			payload: {
+				type: "agent_end",
+				sessionId,
+				...correlation,
+				outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+			},
+		}),
 	]);
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
@@ -1986,7 +2110,14 @@ test("SDK host serializes concurrent prompt admission and replays correlated lif
 	);
 	expect(replayedLifecycle).toEqual([
 		expect.objectContaining({ payload: { type: "agent_start", sessionId, ...correlation } }),
-		expect.objectContaining({ payload: { type: "agent_end", sessionId, ...correlation } }),
+		expect.objectContaining({
+			payload: {
+				type: "agent_end",
+				sessionId,
+				...correlation,
+				outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+			},
+		}),
 	]);
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
@@ -2493,6 +2624,21 @@ test("SDK host binds session query and control seams and excludes uninstalled re
 		const response = await request(`query-${query}`, { type: "query_request", id: `query-${query}`, query });
 		expect(response).toMatchObject({ ok: true, page: { items: [expect.objectContaining(expected)] } });
 	}
+	const activeProviders = await request("query-Q29", {
+		type: "query_request",
+		id: "query-Q29",
+		query: "Q29",
+	});
+	expect(activeProviders).toEqual({
+		type: "query_response",
+		id: "query-Q29",
+		ok: true,
+		page: {
+			items: [{ provider: "fixture-provider", connectionKind: "credential" }],
+			complete: true,
+			revision: "1",
+		},
+	});
 	for (const query of ["Q10", "models.list/current", "models.list", "models.current"]) {
 		const response = await request(`query-${query}`, {
 			type: "query_request",
@@ -2630,8 +2776,228 @@ test("SDK host routes pure ACP permission prompts through a live reverse provide
 		}),
 	);
 	expect(await requested).toEqual({ outcome: "selected", optionId: "allow_once", kind: "allow_once" });
+	const cancelledPermissionAbort = new AbortController();
+	const cancelledPermission = permissionProvider!(
+		{ toolCallId: "call-2", toolName: "bash", title: "printf cancelled", status: "pending" },
+		[{ optionId: "reject_once", name: "Reject once", kind: "reject_once" }],
+		cancelledPermissionAbort.signal,
+	).catch(error => error);
+	await waitFor(
+		() => frames.filter(frame => frame.type === "reverse_request").length >= 2,
+		"second reverse permission request",
+	);
+	const cancelledRequest = frames.filter(frame => frame.type === "reverse_request")[1]!;
+	cancelledPermissionAbort.abort();
+	await waitFor(
+		() => frames.some(frame => frame.type === "reverse_cancel" && frame.id === cancelledRequest.id),
+		"permission reverse cancellation",
+	);
+	expect(await cancelledPermission).toMatchObject({ message: "request_cancelled" });
+	socket.send(
+		JSON.stringify({
+			type: "reverse_response",
+			id: cancelledRequest.id,
+			connectionId,
+			leaseId: cancelledRequest.leaseId,
+			ok: true,
+			result: { outcome: "selected", optionId: "reject_once", kind: "reject_once" },
+		}),
+	);
+	await waitFor(
+		() =>
+			frames.some(
+				frame => frame.type === "reverse_response" && frame.id === cancelledRequest.id && frame.ok === false,
+			),
+		"stale reverse permission response",
+	);
+	expect(frames.filter(frame => frame.type === "reverse_cancel" && frame.id === cancelledRequest.id)).toHaveLength(1);
+	expect(frames.find(frame => frame.type === "reverse_response" && frame.id === cancelledRequest.id)).toMatchObject({
+		ok: false,
+		error: { code: "unknown_request" },
+	});
 	socket.close();
 	await waitFor(() => permissionProvider === undefined, "permission provider removal after disconnect");
+});
+
+test("SDK host routes AskUserQuestion through a live ACP form elicitation provider", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-ui-provider-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-ui-provider-${Date.now()}`;
+	process.env.GJC_NOTIFICATIONS = "1";
+	start(context(cwd, sessionId));
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	const frames: Record<string, unknown>[] = [];
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	await waitFor(() => frames.some(frame => frame.type === "hello"), "SDK hello");
+	const priorAnswerSource = { awaitAnswer: async () => "fallback" };
+	const disposePriorAnswerSource = registerAskAnswerSource(sessionId, priorAnswerSource);
+	expect(getAskAnswerSource(sessionId)).toBe(priorAnswerSource);
+	const connectionId = String(frames.find(frame => frame.type === "hello")?.connectionId);
+	socket.send(
+		JSON.stringify({
+			type: "register_provider",
+			id: "ui",
+			connectionId,
+			capability: "ui",
+			definitions: [],
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "register_provider_result" && frame.id === "ui"),
+		"UI provider registration",
+	);
+	const requested = getAskAnswerSource(sessionId)!.awaitAnswerRequest!(
+		{ question: "Choose one", options: ["First", "Second"], interaction: "selector", controls: [] },
+		new AbortController().signal,
+	);
+	await waitFor(() => frames.some(frame => frame.type === "reverse_request"), "reverse elicitation request");
+	const request = frames.find(frame => frame.type === "reverse_request")!;
+	expect(request).toMatchObject({
+		payload: {
+			method: "ui.elicit",
+			payload: {
+				mode: "form",
+				message: "Choose one",
+				requestedSchema: {
+					type: "object",
+					properties: {
+						value: {
+							type: "string",
+							oneOf: [
+								{ const: "option:0", title: "First" },
+								{ const: "option:1", title: "Second" },
+							],
+						},
+					},
+					required: ["value"],
+				},
+			},
+		},
+	});
+	socket.send(
+		JSON.stringify({
+			type: "reverse_response",
+			id: request.id,
+			connectionId,
+			leaseId: request.leaseId,
+			ok: true,
+			result: { action: "accept", content: { value: "option:1" } },
+		}),
+	);
+	expect(await requested).toBe("Second");
+	const freeText = getAskAnswerSource(sessionId)!.awaitAnswerRequest!(
+		{ question: "Explain", options: [], interaction: "custom_editor", controls: [] },
+		new AbortController().signal,
+	);
+	await waitFor(
+		() => frames.filter(frame => frame.type === "reverse_request").length >= 2,
+		"reverse free-text elicitation",
+	);
+	const freeTextRequest = frames.filter(frame => frame.type === "reverse_request")[1]!;
+	expect(freeTextRequest).toMatchObject({
+		payload: {
+			method: "ui.elicit",
+			payload: {
+				mode: "form",
+				message: "Explain",
+				requestedSchema: {
+					type: "object",
+					properties: { value: { type: "string" } },
+					required: ["value"],
+				},
+			},
+		},
+	});
+	socket.send(
+		JSON.stringify({
+			type: "reverse_response",
+			id: freeTextRequest.id,
+			connectionId,
+			leaseId: freeTextRequest.leaseId,
+			ok: true,
+			result: { action: "accept", content: { value: "Because" } },
+		}),
+	);
+	expect(await freeText).toBe("Because");
+
+	const navigation = getAskAnswerSource(sessionId)!.awaitAnswerRequest!(
+		{
+			question: "Continue",
+			options: [],
+			interaction: "selector",
+			controls: [{ id: "navigation_forward", kind: "navigation", label: "Done", enabled: true }],
+		},
+		new AbortController().signal,
+	);
+	await waitFor(
+		() => frames.filter(frame => frame.type === "reverse_request").length >= 3,
+		"reverse navigation elicitation",
+	);
+	const navigationRequest = frames.filter(frame => frame.type === "reverse_request")[2]!;
+	expect(navigationRequest).toMatchObject({
+		payload: {
+			payload: {
+				requestedSchema: {
+					properties: {
+						value: {
+							type: "string",
+							oneOf: [{ const: "control:navigation_forward", title: "Done" }],
+						},
+					},
+				},
+			},
+		},
+	});
+	socket.send(
+		JSON.stringify({
+			type: "reverse_response",
+			id: navigationRequest.id,
+			connectionId,
+			leaseId: navigationRequest.leaseId,
+			ok: true,
+			result: { action: "accept", content: { value: "control:navigation_forward" } },
+		}),
+	);
+	const navigationReceipt = await navigation;
+	expect(navigationReceipt).toMatchObject({
+		source: "remote",
+		interaction: { kind: "control", controlId: "navigation_forward" },
+	});
+	if (!navigationReceipt || typeof navigationReceipt === "string")
+		throw new Error("Expected a typed navigation receipt.");
+	expect(await navigationReceipt.settle({ kind: "commit" })).toEqual({
+		kind: "committed",
+		ack: { status: "failed", reason: "unsupported" },
+	});
+	const aborted = new AbortController();
+	const cancelled = getAskAnswerSource(sessionId)!.awaitAnswerRequest!(
+		{ question: "Cancel me", options: ["Wait"], interaction: "selector", controls: [] },
+		aborted.signal,
+	);
+	const cancelledOutcome = cancelled.catch(error => error);
+	await waitFor(
+		() => frames.filter(frame => frame.type === "reverse_request").length >= 4,
+		"abortable reverse elicitation",
+	);
+	const cancelledRequest = frames.filter(frame => frame.type === "reverse_request")[3]!;
+	aborted.abort();
+	await waitFor(
+		() => frames.some(frame => frame.type === "reverse_cancel" && frame.id === cancelledRequest.id),
+		"reverse elicitation cancellation",
+	);
+	expect(await cancelledOutcome).toMatchObject({ message: "request_cancelled" });
+
+	socket.close();
+	await waitFor(() => getAskAnswerSource(sessionId) === priorAnswerSource, "prior UI answer source restoration");
+	disposePriorAnswerSource();
 });
 
 test("rejects malformed provider definitions without replacing a valid tools registry", async () => {
@@ -3858,10 +4224,23 @@ test("PresentationArbiter serializes ordinary and workflow asks, fences queued c
 	expect(publications[0]).toMatchObject({ options: ["one", "two"], recommendedIndex: 1 });
 	arbiter.complete("ordinary");
 	expect(publications.map(action => action.workflowGateId)).toEqual([undefined, "workflow-first"]);
+	expect(publications[1]).toMatchObject({
+		options: ["one", "two"],
+		selectedOptionIndices: [],
+		recommendedIndex: 0,
+	});
 	const firstActionId = publications[1]!.id as string;
 	expect(arbiter.toggle(firstActionId, "one")).toBe(true);
 	expect(publications).toHaveLength(3);
-	expect(publications[2]).toMatchObject({ options: ["one", "two"], recommendedIndex: 0 });
+	expect(publications[2]).toMatchObject({
+		question: "(1 selected) workflow-first",
+		options: ["one", "two"],
+		selectedOptionIndices: [0],
+		recommendedIndex: 0,
+	});
+	const replayedActionId = publications[2]!.id as string;
+	arbiter.retain(gate("workflow-first", true, 0));
+	expect(arbiter.presentationFor(replayedActionId)?.selectedOptions).toEqual(["one"]);
 	arbiter.retain(gate("workflow-second"));
 	const queued = arbiter.prepareDirectControl("workflow-second");
 	expect(queued).toEqual({ status: "queued", ordinal: 1 });
@@ -3877,6 +4256,84 @@ test("PresentationArbiter serializes ordinary and workflow asks, fences queued c
 	arbiter.finishDirectControl("workflow-second", uncertain as { status: "retired"; ordinal: number }, "unknown");
 	await Promise.resolve();
 	expect(publications).toHaveLength(4);
+});
+
+test("PresentationArbiter retires and republishes an active replay whose option snapshot changed", () => {
+	const publications: Array<Record<string, unknown>> = [];
+	const retired: string[] = [];
+	const arbiter = new PresentationArbiter(
+		{
+			registerArbitratedAsk(json: string) {
+				const action = JSON.parse(json) as Record<string, unknown>;
+				publications.push(action);
+				return { actionId: action.id as string, registrationEpoch: publications.length };
+			},
+			retireIfUnclaimed(lease: { actionId: string }) {
+				retired.push(lease.actionId);
+				return { status: "retired" as const };
+			},
+		} as never,
+		() => false,
+		"test",
+	);
+	const presentation = (options: string[]) => ({
+		gateId: "workflow",
+		workflowGateId: "workflow",
+		sessionId: "session",
+		question: "Pick",
+		options,
+		controls: [],
+		multi: true,
+		allowEmpty: false,
+		selectedOptions: [],
+	});
+
+	arbiter.retain(presentation(["one", "two"]));
+	const firstActionId = publications[0]!.id as string;
+	expect(arbiter.toggle(firstActionId, "one")).toBe(true);
+	const selectedActionId = publications[1]!.id as string;
+	arbiter.retain(presentation(["two", "three"]));
+
+	expect(retired).toContain(selectedActionId);
+	expect(publications).toHaveLength(3);
+	expect(publications[2]).toMatchObject({
+		options: ["two", "three"],
+		selectedOptionIndices: [],
+	});
+});
+
+test("PresentationArbiter keeps the routed option snapshot when replay retirement lacks terminal proof", () => {
+	const publications: Array<Record<string, unknown>> = [];
+	const arbiter = new PresentationArbiter(
+		{
+			registerArbitratedAsk(json: string) {
+				const action = JSON.parse(json) as Record<string, unknown>;
+				publications.push(action);
+				return { actionId: action.id as string, registrationEpoch: publications.length };
+			},
+			retireIfUnclaimed: () => ({ status: "claimed" as const }),
+		} as never,
+		() => false,
+		"test",
+	);
+	const presentation = (options: string[]) => ({
+		gateId: "workflow",
+		workflowGateId: "workflow",
+		sessionId: "session",
+		question: "Pick",
+		options,
+		controls: [],
+		multi: false,
+		allowEmpty: false,
+		selectedOptions: [],
+	});
+
+	arbiter.retain(presentation(["one", "two"]));
+	const actionId = publications[0]!.id as string;
+	arbiter.retain(presentation(["two", "three"]));
+
+	expect(publications).toHaveLength(1);
+	expect(arbiter.presentationFor(actionId)?.options).toEqual(["one", "two"]);
 });
 
 test("PresentationArbiter terminalizes a queued direct control with explicit non-published proof", () => {

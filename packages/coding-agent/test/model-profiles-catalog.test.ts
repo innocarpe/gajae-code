@@ -53,6 +53,17 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		},
 	},
 	{
+		name: "lunamaxxing",
+		requiredProviders: ["openai-codex"],
+		mapping: {
+			default: "openai-codex/gpt-5.6-luna:medium",
+			executor: "openai-codex/gpt-5.6-luna:xhigh",
+			planner: "openai-codex/gpt-5.6-luna:max",
+			critic: "openai-codex/gpt-5.6-luna:max",
+			architect: "openai-codex/gpt-5.6-luna:max",
+		},
+	},
+	{
 		name: "opencodego",
 		requiredProviders: ["opencode-go"],
 		mapping: {
@@ -265,33 +276,33 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		name: "cursor-eco",
 		requiredProviders: ["cursor"],
 		mapping: {
-			default: "cursor/composer-1.5:low",
-			executor: "cursor/composer-1.5:minimal",
-			planner: "cursor/composer-1.5:low",
-			critic: "cursor/composer-1.5:medium",
-			architect: "cursor/composer-1.5:high",
+			default: "cursor/composer-2.5",
+			executor: "cursor/composer-2.5",
+			planner: "cursor/composer-2.5",
+			critic: "cursor/composer-2.5",
+			architect: "cursor/composer-2.5",
 		},
 	},
 	{
 		name: "cursor-medium",
 		requiredProviders: ["cursor"],
 		mapping: {
-			default: "cursor/composer-1.5:medium",
-			executor: "cursor/composer-1.5:low",
-			planner: "cursor/composer-1.5:medium",
-			critic: "cursor/composer-1.5:high",
-			architect: "cursor/composer-1.5:xhigh",
+			default: "cursor/composer-2.5",
+			executor: "cursor/composer-2.5-fast",
+			planner: "cursor/composer-2.5",
+			critic: "cursor/composer-2.5-fast",
+			architect: "cursor/composer-2.5-fast",
 		},
 	},
 	{
 		name: "cursor-pro",
 		requiredProviders: ["cursor"],
 		mapping: {
-			default: "cursor/composer-1.5:xhigh",
-			executor: "cursor/composer-1.5:medium",
-			planner: "cursor/composer-1.5:high",
-			critic: "cursor/composer-1.5:xhigh",
-			architect: "cursor/composer-1.5:xhigh",
+			default: "cursor/composer-2.5-fast",
+			executor: "cursor/composer-2.5-fast",
+			planner: "cursor/composer-2.5-fast",
+			critic: "cursor/composer-2.5-fast",
+			architect: "cursor/composer-2.5-fast",
 		},
 	},
 	{
@@ -339,6 +350,17 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		},
 	},
 	{
+		name: "alibaba-token-plan-pro",
+		requiredProviders: ["alibaba-token-plan"],
+		mapping: {
+			default: "alibaba-token-plan/qwen3.8-max-preview:medium",
+			executor: "alibaba-token-plan/deepseek-v4-flash-0731:max",
+			planner: "alibaba-token-plan/glm-5.2:high",
+			critic: "alibaba-token-plan/glm-5.2:xhigh",
+			architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
+		},
+	},
+	{
 		name: "alibaba-token-plan-qwenmaxxing",
 		requiredProviders: ["alibaba-token-plan"],
 		mapping: {
@@ -347,6 +369,28 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 			planner: "alibaba-token-plan/qwen3.8-max-preview:medium",
 			critic: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
 			architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
+		},
+	},
+	{
+		name: "alibaba-token-plan-qwen-deepseek",
+		requiredProviders: ["alibaba-token-plan"],
+		mapping: {
+			default: "alibaba-token-plan/qwen-3.8-max:high",
+			executor: "alibaba-token-plan/deepseek-v4-flash-0731:high",
+			planner: "alibaba-token-plan/deepseek-v4-flash-0731:max",
+			critic: "alibaba-token-plan/qwen-3.8-max:xhigh",
+			architect: "alibaba-token-plan/qwen-3.8-max:xhigh",
+		},
+	},
+	{
+		name: "alibaba-token-plan-glm-deepseek",
+		requiredProviders: ["alibaba-token-plan"],
+		mapping: {
+			default: "alibaba-token-plan/glm-5.2:high",
+			executor: "alibaba-token-plan/deepseek-v4-flash-0731:high",
+			planner: "alibaba-token-plan/deepseek-v4-flash-0731:max",
+			critic: "alibaba-token-plan/glm-5.2:xhigh",
+			architect: "alibaba-token-plan/glm-5.2:xhigh",
 		},
 	},
 	{
@@ -439,7 +483,7 @@ const fixedNonCodexComboMappings: Record<string, Partial<Record<Role, string>>> 
 };
 
 describe("built-in model profile catalog", () => {
-	test("contains exact 33-profile matrix cell-for-cell", () => {
+	test("contains exact 37-profile matrix cell-for-cell", () => {
 		expect(BUILTIN_MODEL_PROFILES.map(profile => profile.name)).toEqual(
 			expectedProfiles.map(profile => profile.name),
 		);
@@ -559,7 +603,7 @@ describe("built-in model profile catalog", () => {
 		expect((modelsJson as Record<string, Record<string, unknown>>)["kimi-code"]?.k3).toBeDefined();
 		expect((modelsJson as Record<string, Record<string, unknown>>)["minimax-code"]?.["minimax-m3"]).toBeDefined();
 		expect(
-			(modelsJson as Record<string, Record<string, unknown>>)["alibaba-token-plan"]?.["deepseek-v4-pro"],
+			(modelsJson as Record<string, Record<string, unknown>>)["alibaba-token-plan"]?.["deepseek-v4-flash-0731"],
 		).toBeDefined();
 		expect((modelsJson as Record<string, Record<string, unknown>>)["alibaba-token-plan"]?.["glm-5.2"]).toBeDefined();
 		expect(
@@ -618,8 +662,20 @@ describe("built-in model profile catalog", () => {
 			displayName: "Balanced",
 			providerGroup: "ALIBABA TOKEN PLAN",
 		});
+		expect(getModelProfilePresentation("alibaba-token-plan-pro")).toEqual({
+			displayName: "Pro",
+			providerGroup: "ALIBABA TOKEN PLAN",
+		});
 		expect(getModelProfilePresentation("alibaba-token-plan-qwenmaxxing")).toEqual({
 			displayName: "QwenMaxxing",
+			providerGroup: "ALIBABA TOKEN PLAN",
+		});
+		expect(getModelProfilePresentation("alibaba-token-plan-qwen-deepseek")).toEqual({
+			displayName: "Qwen + DeepSeek",
+			providerGroup: "ALIBABA TOKEN PLAN",
+		});
+		expect(getModelProfilePresentation("alibaba-token-plan-glm-deepseek")).toEqual({
+			displayName: "GLM + DeepSeek",
 			providerGroup: "ALIBABA TOKEN PLAN",
 		});
 	});
@@ -635,6 +691,22 @@ describe("built-in model profile catalog", () => {
 			planner: "grok-build/grok-composer-2.5-fast",
 			critic: "grok-build/grok-composer-2.5-fast",
 		});
+	});
+
+	test("Cursor tiers use distinct current model IDs without inert effort suffixes", () => {
+		const eco = builtinMapping("cursor-eco");
+		const medium = builtinMapping("cursor-medium");
+		const pro = builtinMapping("cursor-pro");
+
+		expect(new Set(Object.values(eco))).toEqual(new Set(["cursor/composer-2.5"]));
+		expect(medium).not.toEqual(eco);
+		expect(pro).not.toEqual(medium);
+		expect(medium.executor).toBe("cursor/composer-2.5-fast");
+		expect(medium.critic).toBe("cursor/composer-2.5-fast");
+		expect(new Set(Object.values(pro))).toEqual(new Set(["cursor/composer-2.5-fast"]));
+		for (const mapping of [eco, medium, pro]) {
+			for (const selector of Object.values(mapping)) expect(selector).not.toContain(":");
+		}
 	});
 
 	test("built-in minimax profiles resolve to minimax-m3 and never minimax-v3 (issue #656)", () => {
@@ -662,12 +734,33 @@ describe("built-in model profile catalog", () => {
 			critic: "alibaba-token-plan/glm-5.2:high",
 			architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
 		});
+		expect(builtinMapping("alibaba-token-plan-pro")).toEqual({
+			default: "alibaba-token-plan/qwen3.8-max-preview:medium",
+			executor: "alibaba-token-plan/deepseek-v4-flash-0731:max",
+			planner: "alibaba-token-plan/glm-5.2:high",
+			critic: "alibaba-token-plan/glm-5.2:xhigh",
+			architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
+		});
 		expect(builtinMapping("alibaba-token-plan-qwenmaxxing")).toEqual({
 			default: "alibaba-token-plan/qwen3.8-max-preview:medium",
 			executor: "alibaba-token-plan/qwen3.8-max-preview:low",
 			planner: "alibaba-token-plan/qwen3.8-max-preview:medium",
 			critic: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
 			architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
+		});
+		expect(builtinMapping("alibaba-token-plan-qwen-deepseek")).toEqual({
+			default: "alibaba-token-plan/qwen-3.8-max:high",
+			executor: "alibaba-token-plan/deepseek-v4-flash-0731:high",
+			planner: "alibaba-token-plan/deepseek-v4-flash-0731:max",
+			critic: "alibaba-token-plan/qwen-3.8-max:xhigh",
+			architect: "alibaba-token-plan/qwen-3.8-max:xhigh",
+		});
+		expect(builtinMapping("alibaba-token-plan-glm-deepseek")).toEqual({
+			default: "alibaba-token-plan/glm-5.2:high",
+			executor: "alibaba-token-plan/deepseek-v4-flash-0731:high",
+			planner: "alibaba-token-plan/deepseek-v4-flash-0731:max",
+			critic: "alibaba-token-plan/glm-5.2:xhigh",
+			architect: "alibaba-token-plan/glm-5.2:xhigh",
 		});
 	});
 

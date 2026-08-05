@@ -1,10 +1,13 @@
 import { $env } from "@gajae-code/utils";
+import { STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE } from "./fallback-transport";
 
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 120_000;
 const DEFAULT_STREAM_FIRST_EVENT_TIMEOUT_MS = 100_000;
+const ALIBABA_TOKEN_PLAN_FIRST_EVENT_TIMEOUT_MS = 600_000;
 const KIMI_CODE_FIRST_EVENT_TIMEOUT_MS = 300_000;
 
 export function getProviderFirstEventTimeoutFallbackMs(provider: string): number | undefined {
+	if (provider === "alibaba-token-plan") return ALIBABA_TOKEN_PLAN_FIRST_EVENT_TIMEOUT_MS;
 	return provider === "kimi-code" ? KIMI_CODE_FIRST_EVENT_TIMEOUT_MS : undefined;
 }
 
@@ -65,7 +68,46 @@ export function getStreamFirstEventTimeoutMs(
 	return normalizeIdleTimeoutMs($env.PI_STREAM_FIRST_EVENT_TIMEOUT_MS, fallback);
 }
 
+/**
+ * Resolves the OpenAI SDK client `timeout` so stalled-before-headers requests are
+ * bounded by the same first-event window the transport watchdog uses after
+ * `create()` returns. Without this, providers that only arm
+ * `iterateWithIdleTimeout` post-setup can wait the full SDK default (10 minutes
+ * per attempt) before any provider-owned watchdog exists.
+ *
+ * - Explicit `0` disables the request timeout (the SDK treats `timeout: 0` as an
+ *   immediate failure, so callers that disable the first-event watchdog must not
+ *   pass a timeout).
+ * - Providers with a first-event fallback (Alibaba, Kimi) honor an explicit
+ *   nonzero override as-is, even when shorter than the fallback.
+ * - Other providers floor an explicit override at the env/default first-event
+ *   window so a short post-connect first-event budget cannot kill legitimate
+ *   slow setup.
+ */
+export function resolveOpenAISdkRequestTimeoutMs(
+	provider: string,
+	streamFirstEventTimeoutOverride?: number,
+): number | undefined {
+	const providerFirstEventFallbackMs = getProviderFirstEventTimeoutFallbackMs(provider);
+	const envSdkTimeoutMs = getStreamFirstEventTimeoutMs(getOpenAIStreamIdleTimeoutMs(), providerFirstEventFallbackMs);
+	if (streamFirstEventTimeoutOverride === 0) return undefined;
+	if (streamFirstEventTimeoutOverride !== undefined) {
+		return providerFirstEventFallbackMs !== undefined
+			? streamFirstEventTimeoutOverride
+			: Math.max(envSdkTimeoutMs ?? 0, streamFirstEventTimeoutOverride);
+	}
+	return envSdkTimeoutMs;
+}
+
 export type Watchdog = NodeJS.Timeout | undefined;
+export class FirstEventTimeoutError extends Error {
+	readonly providerCode = STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE;
+
+	constructor(message: string) {
+		super(message);
+		this.name = "FirstEventTimeoutError";
+	}
+}
 
 const dummyWatchdog = setTimeout(() => {}, 1);
 clearTimeout(dummyWatchdog);
@@ -228,9 +270,9 @@ export async function* iterateWithIdleTimeout<T>(
 					options.onFirstItemTimeout?.();
 				}
 				closeIterator();
-				throw new Error(
-					!awaitingFirstItem ? options.errorMessage : (options.firstItemErrorMessage ?? options.errorMessage),
-				);
+				throw awaitingFirstItem
+					? new FirstEventTimeoutError(options.firstItemErrorMessage ?? options.errorMessage)
+					: new Error(options.errorMessage);
 			}
 			if (outcome.kind === "error") {
 				throw outcome.error;

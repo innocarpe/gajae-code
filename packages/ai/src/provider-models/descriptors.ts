@@ -26,6 +26,7 @@ import {
 	kimiCodeModelManagerOptions,
 	litellmModelManagerOptions,
 	lmStudioModelManagerOptions,
+	maraModelManagerOptions,
 	mistralModelManagerOptions,
 	moonshotModelManagerOptions,
 	nanoGptModelManagerOptions,
@@ -47,7 +48,12 @@ import {
 	xiaomiModelManagerOptions,
 	zenmuxModelManagerOptions,
 } from "./openai-compat";
-import { cursorModelManagerOptions, glmZcodeModelManagerOptions, zaiModelManagerOptions } from "./special";
+import {
+	cursorModelManagerOptions,
+	glmZcodeModelManagerOptions,
+	openCodexModelManagerOptions,
+	zaiModelManagerOptions,
+} from "./special";
 
 /** Catalog discovery configuration for providers that support endpoint-based model listing. */
 export interface CatalogDiscoveryConfig {
@@ -138,6 +144,7 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 		catalog("Alibaba Token Plan", ["ALIBABA_TOKEN_PLAN_API_KEY"], { oauthProvider: "alibaba-token-plan" }),
 	),
 	descriptor("openai", "gpt-5.4", config => openaiModelManagerOptions(config)),
+	descriptor("opencodex", "gpt-5.4", () => openCodexModelManagerOptions(), { allowUnauthenticated: true }),
 	descriptor("groq", "openai/gpt-oss-120b", config => groqModelManagerOptions(config)),
 	catalogDescriptor(
 		"huggingface",
@@ -325,6 +332,12 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 		"anthropic/claude-sonnet-4.5",
 		config => bizrouterModelManagerOptions(config),
 		catalog("BizRouter", ["BIZROUTER_API_KEY"]),
+	),
+	catalogDescriptor(
+		"mara",
+		"DeepSeek-V3.1",
+		config => maraModelManagerOptions(config),
+		catalog("Mara Cloud", ["MARA_API_KEY"]),
 	),
 	catalogDescriptor("zai", "glm-5.2", config => zaiModelManagerOptions(config), catalog("zAI", ["ZAI_API_KEY"])),
 	catalogDescriptor(

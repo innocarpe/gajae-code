@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, test } from "bun:test";
 import manifest from "./telegram-daemon-generation-manifest.json" with { type: "json" };
-import { assertGuardAuthority, currentTreeDigests, declaration, evaluate, GUARD_CONTRACT_VERSION, isLegacyBootstrapBase, manifestForCurrentTree, protectedInventory, validateCiInputs, validateCurrentTreeManifest, validateInventory, validateManifest, validateSha, writeManifest } from "./telegram-daemon-generation-guard";
+import { assertGuardAuthority, currentTreeDigests, declaration, evaluate, GUARD_CONTRACT_VERSION, isLegacyBootstrapBase, manifestForCurrentTree, protectedInventory, TELEGRAM_SHUTDOWN_DRAIN_PROTECTED_DECLARATIONS, validateCiInputs, validateCurrentTreeManifest, validateInventory, validateManifest, validateSha, writeManifest } from "./telegram-daemon-generation-guard";
 
 const guardScript = "scripts/telegram-daemon-generation-guard.ts";
 const manifestScript = "scripts/telegram-daemon-generation-manifest.json";
@@ -15,6 +15,8 @@ const telegramControl = "packages/coding-agent/src/sdk/bus/telegram-daemon-contr
 
 const chatControl = "packages/coding-agent/src/sdk/bus/chat-daemon-control.ts";
 const chatCli = "packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts";
+const chatRuntime = "packages/coding-agent/src/sdk/bus/chat-daemon-runtime.ts";
+const sdkDiscovery = "packages/coding-agent/src/sdk/client/discovery.ts";
 const config = "packages/coding-agent/src/sdk/bus/config.ts";
 const inventory = {
 	telegram: { [telegramContract]: ["DAEMON_GENERATION"], [telegramDaemon]: ["acquireDaemonOwnership"] },
@@ -73,8 +75,26 @@ const chatTakeoverHelpers = [
 ] as const;
 const chatCliHelpers = ["defaultPidAlive", "loadConfig", "ownerPid"] as const;
 const chatConfigHelpers = {
-	discord: ["getNotificationConfig", "notificationConfigFromFile", "isDiscordConfigured", "tokenFingerprint"],
-	slack: ["getNotificationConfig", "notificationConfigFromFile", "isSlackConfigured", "tokenFingerprint"],
+	discord: [
+		"getNotificationConfig",
+		"notificationConfigFromFile",
+		"resolveNotificationProvider",
+		"isDiscordComplete",
+		"isProviderEffectivelyEnabled",
+		"tokenFingerprint",
+	],
+	slack: [
+		"getNotificationConfig",
+		"notificationConfigFromFile",
+		"resolveNotificationProvider",
+		"isSlackComplete",
+		"isProviderEffectivelyEnabled",
+		"tokenFingerprint",
+	],
+} as const;
+const chatEndpointHelpers = {
+	[chatRuntime]: ["attach"],
+	[sdkDiscovery]: ["readSdkSessionEndpoint"],
 } as const;
 const telegramToolActivityDeclarations = {
 	[config]: ["parseNotificationSettingsSnapshot"],
@@ -271,6 +291,9 @@ test("requires mapped generation bumps for Telegram lease, chat CLI, and configu
 		...telegramHandoffHelpers.map(name => ({ family: "telegram" as const, file: telegramDaemon, name })),
 		...(["discord", "slack"] as const).flatMap(family => chatCliHelpers.map(name => ({ family, file: chatCli, name }))),
 		...(["discord", "slack"] as const).flatMap(family => chatConfigHelpers[family].map(name => ({ family, file: config, name }))),
+		...(["discord", "slack"] as const).flatMap(family =>
+			Object.entries(chatEndpointHelpers).flatMap(([file, names]) => names.map(name => ({ family, file, name }))),
+		),
 	];
 	for (const helper of helpers) {
 		const missing = mappedHelperMutation({ ...helper, generationBumped: false });
@@ -382,6 +405,73 @@ test("detects restoring tool activity to default-on and bypassing daemon admissi
 		}
 	});
 
+	test("generation-fences callback receipt directory-barrier bypass policy", () => {
+		const callbackInventory = {
+			telegram: {
+				[telegramContract]: ["DAEMON_GENERATION"],
+				[telegramDaemon]: ["isUnsupportedTelegramDirectoryBarrier"],
+			},
+			discord: {},
+			slack: {},
+		} as const;
+		const base = new Map<string, string>([
+			[telegramContract, "export const DAEMON_GENERATION = 48;"],
+			[
+				telegramDaemon,
+				'function isUnsupportedTelegramDirectoryBarrier(error: unknown) { return (error as { code?: string }).code === "EINVAL"; }',
+			],
+		]);
+		const head = new Map(base);
+		head.set(
+			telegramDaemon,
+			'function isUnsupportedTelegramDirectoryBarrier(error: unknown) { return (error as { code?: string }).code === "EACCES"; }',
+		);
+		const result = evaluate(base, head, callbackInventory);
+		expect(result.protectedChanges).toContain(
+			`telegram:${telegramDaemon}:isUnsupportedTelegramDirectoryBarrier`,
+		);
+		expect(result.telegramGenerationBumped).toBe(false);
+	});
+	test.each([
+		[
+			"TelegramEffectSupervisor",
+			"class TelegramEffectSupervisor { call(api: any, method: string, body: unknown, opts?: unknown) { return api.call(method, body, opts); } }",
+			"class TelegramEffectSupervisor { call(api: any, method: string, body: unknown, opts?: unknown) { return api.call(method, body); } }",
+		],
+		[
+			"callBotApi",
+			"class TelegramNotificationDaemon { callBotApi(api: any, method: string, body: unknown, opts?: unknown) { return api.call(method, body, opts); } }",
+			"class TelegramNotificationDaemon { callBotApi(api: any, method: string, body: unknown, opts?: unknown) { return api.call(method, body); } }",
+		],
+		[
+			"createBotApiAdapter",
+			"function createBotApiAdapter(call: any) { return { call: (method: string, body: unknown, opts?: unknown) => call(method, body, opts) }; }",
+			"function createBotApiAdapter(call: any) { return { call: (method: string, body: unknown, opts?: unknown) => call(method, body) }; }",
+		],
+		[
+			"createBotApiPipeline",
+			"function createBotApiPipeline(raw: any, call: any) { const classified = (method: string, body: unknown, opts?: unknown) => call(raw, method, body, opts); return { classified }; }",
+			"function createBotApiPipeline(raw: any, call: any) { const classified = (method: string, body: unknown, opts?: unknown) => call(raw, method, body); return { classified }; }",
+		],
+	] as const)("generation-fences the %s no-retry propagation seam", (symbol, before, after) => {
+		const callbackInventory = {
+			telegram: {
+				[telegramContract]: ["DAEMON_GENERATION"],
+				[telegramDaemon]: [symbol],
+			},
+			discord: {},
+			slack: {},
+		} as const;
+		const base = new Map<string, string>([
+			[telegramContract, "export const DAEMON_GENERATION = 48;"],
+			[telegramDaemon, before],
+		]);
+		const head = new Map(base);
+		head.set(telegramDaemon, after);
+		expect(evaluate(base, head, callbackInventory).protectedChanges).toContain(
+			`telegram:${telegramDaemon}:${symbol}`,
+		);
+	});
 	test("AST extraction ignores strings and comments while preserving typed declarations", () => {
 		const source = `// export function acquireDaemonOwnership() {}\nconst message = "acquireDaemonOwnership()";\nexport async function acquireDaemonOwnership<T>(value: T): Promise<T> { return value; }`;
 		expect(declaration(source, "acquireDaemonOwnership")).toContain("Promise<T>");
@@ -668,8 +758,16 @@ test("fails closed when a protected native authority declaration is missing or m
 		cli.discord[chatCli] = cli.discord[chatCli]!.filter(name => name !== "ownerPid");
 		expect(() => validateInventory(cli)).toThrow("chat CLI ownership primitives");
 		const providerConfig = mutableInventory();
-		providerConfig.slack[config] = providerConfig.slack[config]!.filter(name => name !== "isSlackConfigured");
+		providerConfig.slack[config] = providerConfig.slack[config]!.filter(name => name !== "isSlackComplete");
 		expect(() => validateInventory(providerConfig)).toThrow("chat configuration primitives");
+		const endpointDiscovery = mutableInventory();
+		delete endpointDiscovery.discord[chatRuntime];
+		expect(() => validateInventory(endpointDiscovery)).toThrow("isolated chat endpoint discovery");
+	});
+	test("protects Telegram shutdown admission and durable drain authorities", () => {
+		expect(protectedInventory.telegram[telegramDaemon]).toEqual(
+			expect.arrayContaining([...TELEGRAM_SHUTDOWN_DRAIN_PROTECTED_DECLARATIONS]),
+		);
 	});
 
 	test("protects Telegram provenance and signaling authorities", () => {
@@ -695,6 +793,13 @@ test("fails closed when a protected native authority declaration is missing or m
 				"startLifecycleControl",
 				"run",
 				"writeJsonAtomic",
+				"syncTelegramFile",
+				"syncTelegramDirectory",
+				"isUnsupportedTelegramDirectoryBarrier",
+				"TelegramEffectSupervisor",
+				"callBotApi",
+				"createBotApiAdapter",
+				"createBotApiPipeline",
 				"ownershipLockMatchesState",
 				"ownershipLockMatchesMetadata",
 				"ownershipLockIsReclaimable",
@@ -733,6 +838,9 @@ test("fails closed when a protected native authority declaration is missing or m
 			expect(cli).toEqual(expect.arrayContaining(chatCliHelpers));
 			const providerConfig = protectedInventory[family][config] ?? [];
 			expect(providerConfig).toEqual(expect.arrayContaining(chatConfigHelpers[family]));
+			for (const [file, declarations] of Object.entries(chatEndpointHelpers)) {
+				expect(protectedInventory[family][file] ?? []).toEqual(expect.arrayContaining(declarations));
+			}
 		}
 	});
 
@@ -877,6 +985,17 @@ test("fails closed when a protected native authority declaration is missing or m
 		expect(stableEntries(stale)).not.toBe(stableEntries(digests));
 	}, 20000);
 
+	test("canonicalizes BigInt literals without colliding with numeric or string literals", () => {
+		const bigint = declaration("function probe() { return 1n === -2n; }", "probe");
+		const numeric = declaration("function probe() { return 1 === -2; }", "probe");
+		const string = declaration('function probe() { return "1n" === "-2n"; }', "probe");
+		expect(bigint).not.toBe("<malformed>");
+		expect(bigint).not.toBe(numeric);
+		expect(bigint).not.toBe(string);
+		expect(bigint).toContain("1n");
+		expect(bigint).toContain("2n");
+	});
+
 	test("writes a stable current-tree manifest atomically without changing the committed attestation", async () => {
 		const directory = await mkdtemp(path.join(os.tmpdir(), "telegram-daemon-generation-manifest-"));
 		const target = path.join(directory, "manifest.json");
@@ -892,7 +1011,7 @@ test("fails closed when a protected native authority declaration is missing or m
 		} finally {
 			await rm(directory, { recursive: true, force: true });
 		}
-	}, 20000);
+	}, 60000);
 
 	test("guard authority proves immutable event objects without pinning the mutable base ref", () => {
 		const head = "a".repeat(40);

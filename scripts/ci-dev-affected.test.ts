@@ -16,6 +16,8 @@ const packages: WorkspacePackage[] = [
 	},
 ];
 
+const EMBEDDED_DOCS_GATE_KEY = "test:packages/coding-agent/test/docs-index-lazy.test.ts";
+
 function planForPaths(paths: readonly string[]) {
 	return planTasks(paths, packages);
 }
@@ -57,6 +59,20 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(hash(noShardReceipt)).toBe("7f3cb1ebf7ca106b8030dd79353dabbc57ed22137ac41e169cc5700d29493091");
 		expect(hash(multiShardReceipt)).toBe("2c298faf1d92681cef1499a7526d1df0e8aee947694804d50aa47e015b222e26");
 	});
+	test("requires a pull request exact head to contain the event base before planning", async () => {
+		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
+		const guardStart = workflow.indexOf("      - name: Verify PR head contains exact base");
+		const guardEnd = workflow.indexOf("\n      - ", guardStart + 1);
+		const guard = workflow.slice(guardStart, guardEnd);
+		expect(guardStart).toBeGreaterThan(0);
+		expect(guard).toContain("if: ${{ github.event_name == 'pull_request' }}");
+		expect(guard).toContain('if ! git fetch --no-tags origin "${GITHUB_BASE_SHA}"; then');
+		expect(guard).toContain("Could not fetch immutable event base ${GITHUB_BASE_SHA}");
+		expect(guard).toContain('if git merge-base --is-ancestor "${GITHUB_BASE_SHA}" HEAD; then');
+		expect(guard).toContain("merge-base exit ${status}");
+		expect(guard).toContain("rebase onto current ${GITHUB_BASE_REF}");
+	});
+
 	test("uses a detached finalized evidence producer and artifact-ID consumer", async () => {
 		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
 		expect(workflow).toContain("affected-evidence-producer:");
@@ -83,6 +99,9 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).toContain("CI_DEV_TELEGRAM_GUARD_REQUIRED: ${{ needs.affected-plan.outputs.relevant }}");
 		expect(workflow).toContain("CI_DEV_TELEGRAM_WINDOWS_RESULT: ${{ needs.windows-telegram-daemon-safety.result }}");
 		expect(workflow).toContain("CI_DEV_TELEGRAM_WINDOWS_REQUIRED:");
+		expect(workflow).toContain("bun test ./packages/natives/test/path-identity-windows.test.ts");
+		expect(workflow).toContain("contains(needs.affected-plan.outputs.changed_paths, 'packages/natives/test/path-identity-windows.test.ts')");
+		expect(workflow).toContain("contains(needs.affected-plan.outputs.changed_paths, 'packages/natives/native/index.js')");
 		expect(workflow).not.toContain("pull_request_target");
 		expect(workflow).not.toContain("github.run_attempt");
 		expect(workflow).toContain("artifact_digest");
@@ -130,7 +149,11 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(windowsJob).toContain("runs-on: windows-latest");
 		expect(windowsJob).toContain("needs.affected-plan.outputs.has_windows_session_path == 'true'");
 		expect(windowsJob).toContain("Windows session-path canonicalization regression");
-		expect(windowsJob).toContain("bun test packages/coding-agent/test/session-manager/windows-canonical-path.test.ts");
+		// The `./` prefix is load-bearing on Windows: without it Bun treats the argument
+		// as a name filter rather than a path, matches nothing, and exits 1. Pinned here
+		// and enforced workflow-wide by dev-ci-guard-topology.test.ts.
+		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session-manager/windows-canonical-path.test.ts");
+		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session/managed-lock-lease.windows.test.ts");
 		// The required predicate must textually match the job gate so the aggregate
 		// invariant (windowsDoctor === required ? success : skipped) never fails closed.
 		const requiredLines = workflow.split("\n").filter(line => line.includes("CI_DEV_WINDOWS_DOCTOR_REQUIRED:"));
@@ -931,8 +954,10 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		expect(stderr).toContain("not in the current plan");
 	});
 
+	// CHANGELOG.md, not a docs/ path: docs/**/*.md selects the embedded-docs gate,
+	// which is a native consumer and therefore now carries a native producer.
 	test("--native-build is a no-op when the plan has no native build task", async () => {
-		const { stdout, exitCode } = await runScript(["--native-build"], "docs/readme.md");
+		const { stdout, exitCode } = await runScript(["--native-build"], "CHANGELOG.md");
 		expect(exitCode).toBe(0);
 		expect(stdout).toContain("no native build tasks in plan");
 	});
@@ -1048,9 +1073,13 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 	test("routes the Windows session-path regression for session I/O sources and its regression test", () => {
 		for (const changedPath of [
 			"packages/coding-agent/src/session/internal/managed-session-scope.ts",
+			"packages/coding-agent/src/session/internal/managed-session-storage.ts",
 			"packages/coding-agent/src/session/blob-store.ts",
+			"packages/coding-agent/src/sdk/session-directory.ts",
 			"packages/coding-agent/src/session/session-manager.ts",
 			"packages/coding-agent/test/session-manager/windows-canonical-path.test.ts",
+			"packages/coding-agent/test/session/managed-lock-lease.windows.test.ts",
+			"packages/coding-agent/test/sdk-session-directory.windows.test.ts",
 		]) {
 			expect(isWindowsSessionPathRegressionPath(changedPath)).toBe(true);
 			expect(needsWindowsSessionPathRegression([changedPath])).toBe(true);
@@ -1227,8 +1256,65 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: true, nativeBuild: false });
 	});
 
-	test("docs/changelog-only changes plan nothing expensive", () => {
-		expect(targeted(["docs/guide.md", "CHANGELOG.md", "packages/coding-agent/README.md"])).toEqual([]);
+	test("changelog and package-readme-only changes plan nothing", () => {
+		expect(targeted(["CHANGELOG.md", "packages/coding-agent/README.md"])).toEqual([]);
+	});
+
+	// docs/ is the source the embedded docs index is generated from, so shipping a
+	// docs edit without regenerating that index is the one drift class a docs-only
+	// change can introduce. Both planners must select that gate, because dev CI runs
+	// on push as well as pull_request. The gate reads the generated corpus through the
+	// package barrel, so it is a native consumer: it has to bring its own producer, or
+	// the shard's `if: matrix.native` download step asks for an artifact that the
+	// skipped `affected-native` job never uploaded.
+	test("docs-only changes select the embedded-docs gate and its native producer", () => {
+		const changed = ["docs/guide.md", "docs/nested/other.md"];
+		for (const keys of [targeted(changed), planTasks(changed, packages)].map(tasks =>
+			tasks.map(task => task.key),
+		)) {
+			expect(keys).toEqual([EMBEDDED_DOCS_GATE_KEY, "native-linux-x64"]);
+		}
+	});
+
+	// The producer invariant stated as the matrix sees it: any plan with a native
+	// consumer must also carry a native producer, or has_native gates it off.
+	test("a docs-only plan never ships a native consumer without a producer", () => {
+		for (const changed of [["docs/guide.md"], ["docs/tools/read.md", "docs/guide.md"]]) {
+			for (const tasks of [targeted(changed), planTasks(changed, packages)]) {
+				const entries = describeTasks(tasks);
+				expect(entries.some(entry => entry.native)).toBe(true);
+				expect(entries.some(entry => entry.nativeBuild)).toBe(true);
+			}
+		}
+	});
+
+	// The generated index is a real source file, so it also pulls its owning-package
+	// tasks. The gate must still be selected -- that is the half a docs-only plan
+	// cannot cover on its own.
+	test("a generated-docs-index change also selects the embedded-docs gate", () => {
+		for (const changed of [
+			["packages/coding-agent/src/internal-urls/docs-index.generated.ts"],
+			["docs/guide.md", "packages/coding-agent/src/internal-urls/docs-index.generated.ts"],
+		]) {
+			for (const tasks of [targeted(changed), planTasks(changed, packages)]) {
+				expect(tasks.map(task => task.key)).toContain(EMBEDDED_DOCS_GATE_KEY);
+			}
+		}
+	});
+
+	// Markdown outside docs/ is not embedded, so it must not drag the gate in.
+	test("the embedded-docs gate stays out of unrelated plans", () => {
+		for (const changed of [
+			["CHANGELOG.md"],
+			["packages/coding-agent/README.md"],
+			["README.md"],
+			[".gjc/skills/example/SKILL.md"],
+			["packages/example/src/index.ts"],
+		]) {
+			for (const tasks of [targeted(changed), planTasks(changed, packages)]) {
+				expect(tasks.map(task => task.key)).not.toContain(EMBEDDED_DOCS_GATE_KEY);
+			}
+		}
 	});
 
 test("Python SDK changes plan dedicated Python validation and one native build", () => {

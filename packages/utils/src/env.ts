@@ -52,7 +52,17 @@ const projectEnv = parseEnvFile(path.join(process.cwd(), ".env"));
 const inheritedEnv = filterCredentialInheritedEnv(Bun.env);
 
 export function $inheritedEnv(name: string): string | undefined {
-	return resolveFileEnvValue(inheritedEnv, name);
+	const snapshotValue = resolveFileEnvValue(inheritedEnv, name);
+	if (snapshotValue === undefined) return undefined;
+	// The snapshot records provenance — this key was inherited from the launching
+	// shell rather than the caller's cwd/.env — and pins the value so a later
+	// in-process write cannot swap the credential we authenticate with. It is not
+	// a cache that outlives the variable: once the key is removed from the live
+	// environment it is no longer inherited, so deletion is honoured. Without
+	// this, a credential present at import time can never be suppressed (tests
+	// that clear provider env vars silently keep resolving the real credential).
+	if (Bun.env[name] === undefined) return undefined;
+	return snapshotValue;
 }
 
 function resolveLiveCredentialEnvValue(name: string): string | undefined {
@@ -137,16 +147,20 @@ export function $pickCredentialEnv(...keys: string[]): string | undefined {
 	return undefined;
 }
 
+function parsePositiveInteger(raw: string | undefined): number | undefined {
+	const value = raw?.trim();
+	if (!value || !/^\d+$/.test(value)) return undefined;
+	const parsed = Number(value);
+	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
 /**
  * Parses a positive decimal integer from `$env[name]`.
- * Empty, invalid, NaN, zero, or negative values return `defaultValue`.
+ * Empty, invalid, unsafe, zero, or negative values return `defaultValue`.
  */
 export function $envpos(name: string, defaultValue: number): number {
-	const raw = $env[name];
-	if (!raw) return defaultValue;
-	const parsed = Number.parseInt(raw, 10);
-	if (Number.isNaN(parsed) || parsed <= 0) return defaultValue;
-	return parsed;
+	const parsed = parsePositiveInteger($env[name]);
+	return parsed ?? defaultValue;
 }
 
 /** True when `BUN_ENV` or `NODE_ENV` is the string `test`. */
@@ -190,10 +204,8 @@ export function $pickflag(...keys: string[]): boolean {
 /** Resolve the first positive integer among keys, else defaultValue (GJC-first). Set-but-invalid keys are skipped. */
 export function $pickenvpos(keys: string[], defaultValue: number): number {
 	for (const key of keys) {
-		const raw = $env[key]?.trim();
-		if (!raw) continue;
-		const parsed = Number.parseInt(raw, 10);
-		if (!Number.isNaN(parsed) && parsed > 0) return parsed;
+		const parsed = parsePositiveInteger($env[key]);
+		if (parsed !== undefined) return parsed;
 	}
 	return defaultValue;
 }

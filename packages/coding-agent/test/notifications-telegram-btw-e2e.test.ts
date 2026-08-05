@@ -6,12 +6,7 @@ import { NotificationServer } from "../../natives/native/index.js";
 import { Settings } from "../src/config/settings";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { createNotificationsExtension } from "../src/sdk/bus";
-import {
-	type BotApi,
-	registerNotificationRoot,
-	type TelegramDaemonFs,
-	TelegramNotificationDaemon,
-} from "../src/sdk/bus/telegram-daemon";
+import { type BotApi, registerNotificationRoot, TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
 
 const THREAD_ID = 901;
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
@@ -117,7 +112,6 @@ test("real notifications extension rejects an in-flight /btw response after reco
 		botToken: "token",
 		chatId: "42",
 		botApi: bot,
-		fs: fs.promises as unknown as TelegramDaemonFs,
 		pidAlive: () => true,
 		btw: { enabled: true },
 		rich: { enabled: true },
@@ -255,9 +249,9 @@ test("/btw travels through NotificationServer and a real WebSocket with one stri
 			botToken: "token",
 			chatId: "42",
 			botApi: bot,
-			fs: fs.promises as unknown as TelegramDaemonFs,
 			pidAlive: () => true,
 			btw: { enabled: true },
+			sound: "all",
 		});
 		try {
 			await daemon.scanRoots();
@@ -273,7 +267,7 @@ test("/btw travels through NotificationServer and a real WebSocket with one stri
 					daemon.sessions.get(sessionId)?.ephemeralCapable === true,
 				"ephemeral capability replay",
 			);
-			await sleep(80);
+			await waitFor(() => bot.count("sendMessage") >= 1, "identity header delivery");
 			const terminalDispatchCount = () =>
 				bot.calls.filter(call => call.method === "sendMessage" || call.method === "sendRichMessage").length;
 			const terminalRichDispatchCount = () => bot.count("sendRichMessage");
@@ -373,6 +367,7 @@ test("/btw travels through NotificationServer and a real WebSocket with one stri
 			expect(terminalDispatchCount()).toBe(before + 1);
 			const reply = bot.calls.at(-1)!;
 			expect(reply.body).toMatchObject({ chat_id: "42", message_thread_id: THREAD_ID });
+			expect(reply.body.disable_notification).toBeUndefined();
 			sessionRouter.dispatch = originalDispatch;
 		} finally {
 			daemon.requestStop();
@@ -430,7 +425,6 @@ test("/btw reconnect does not replay an in-flight provider request", async () =>
 			botToken: "token",
 			chatId: "42",
 			botApi: bot,
-			fs: fs.promises as unknown as TelegramDaemonFs,
 			pidAlive: () => true,
 			btw: { enabled: true },
 			rich: { enabled: false },
@@ -542,7 +536,6 @@ test("/btw generation replacement terminalizes an old pending request exactly on
 			botToken: "token",
 			chatId: "42",
 			botApi: bot,
-			fs: fs.promises as unknown as TelegramDaemonFs,
 			pidAlive: () => true,
 			btw: { enabled: true },
 			rich: { enabled: false },
